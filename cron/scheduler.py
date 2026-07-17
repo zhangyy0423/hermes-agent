@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -156,6 +157,95 @@ class CronPromptInjectionBlocked(Exception):
     malicious skill could carry an injection payload that reached the
     non-interactive (auto-approve) cron agent.
     """
+
+
+class CronPrerequisiteFailed(Exception):
+    """Raised when a job declares its pre-run script as a hard prerequisite."""
+
+
+def _write_job_artifact(job: dict, final_response: str) -> Path:
+    """Atomically persist a cron job's final response inside its workdir.
+
+    ``artifact_path`` is deliberately job-relative rather than an arbitrary
+    absolute path.  Resolving it under ``workdir`` keeps cron output within the
+    job's already-declared filesystem boundary and blocks ``..`` as well as
+    symlink escapes.  The helper raises on every contract violation so the
+    scheduler can mark the business run failed instead of reporting a false
+    success merely because the model returned text.
+    """
+    raw_artifact_path = str(job.get("artifact_path") or "").strip()
+    if not raw_artifact_path:
+        raise ValueError("artifact_path is required")
+
+    raw_workdir = str(job.get("workdir") or "").strip()
+    if not raw_workdir:
+        raise ValueError("workdir is required when artifact_path is configured")
+
+    workdir = Path(raw_workdir).expanduser().resolve()
+    if not workdir.is_dir():
+        raise ValueError(f"workdir is not an existing directory: {workdir}")
+
+    rendered = raw_artifact_path.replace(
+        "{YYYY-MM-DD}", _hermes_now().strftime("%Y-%m-%d")
+    )
+    relative_path = Path(rendered).expanduser()
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("artifact_path must be relative to workdir without '..'")
+
+    target = (workdir / relative_path).resolve()
+    try:
+        target.relative_to(workdir)
+    except ValueError as exc:
+        raise ValueError("artifact_path resolves outside workdir") from exc
+
+    try:
+        minimum_chars = int(job.get("artifact_min_chars", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("artifact_min_chars must be a positive integer") from exc
+    if minimum_chars < 1:
+        raise ValueError("artifact_min_chars must be a positive integer")
+    if len(final_response.strip()) < minimum_chars:
+        raise ValueError(
+            "final response is shorter than artifact_min_chars "
+            f"({len(final_response.strip())} < {minimum_chars})"
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent = target.parent.resolve()
+    try:
+        resolved_parent.relative_to(workdir)
+    except ValueError as exc:
+        raise ValueError("artifact_path parent resolves outside workdir") from exc
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(resolved_parent)
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(final_response)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        try:
+            directory_fd = os.open(resolved_parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    # Directory fsync is not supported on every platform.
+                    # The file itself was already fsynced before os.replace.
+                    pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    return target
 
 
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
@@ -2310,7 +2400,16 @@ def _run_job_script(
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
-        _script_cwd = workdir or str(path.parent)
+        _script_cwd = str(path.parent)
+        if workdir:
+            configured_workdir = Path(workdir).expanduser().resolve()
+            if not configured_workdir.is_dir():
+                return False, (
+                    "Configured job workdir is not an existing directory: "
+                    f"{configured_workdir}"
+                )
+            _script_cwd = str(configured_workdir)
+            env["HERMES_CRON_WORKDIR"] = str(configured_workdir)
         result = subprocess.run(
             argv,
             capture_output=True,
@@ -2467,7 +2566,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            workdir = job.get("workdir")
+            if workdir:
+                success, script_output = _run_job_script(
+                    script_path, workdir=workdir
+                )
+            else:
+                success, script_output = _run_job_script(script_path)
         if success:
             if script_output:
                 prompt = (
@@ -2482,6 +2587,10 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 # Script produced no output — nothing to report, skip AI call.
                 return None
         else:
+            if job.get("script_fail_closed"):
+                raise CronPrerequisiteFailed(
+                    f"Pre-run script failed: {script_output}"
+                )
             prompt = (
                 "## Script Error\n"
                 "The data-collection script failed. Report this to the user.\n\n"
@@ -2986,6 +3095,21 @@ def run_job(
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
+    except CronPrerequisiteFailed as prerequisite_exc:
+        logger.warning(
+            "Job '%s' (ID: %s): prerequisite failed — %s",
+            job_name,
+            job_id,
+            prerequisite_exc,
+        )
+        failed_doc = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** PREREQUISITE_FAILED\n\n"
+            f"{prerequisite_exc}\n"
+        )
+        return False, failed_doc, "", str(prerequisite_exc)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3996,6 +4120,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     "Interrupted by gateway shutdown before the run finished "
                     "(tool subprocess was killed mid-flight)."
                 )
+
+            if success and job.get("artifact_path"):
+                try:
+                    artifact_file = _write_job_artifact(job, final_response)
+                    if verbose:
+                        logger.info("Business artifact saved to: %s", artifact_file)
+                except Exception as artifact_exc:
+                    success = False
+                    error = f"Business artifact write failed: {artifact_exc}"
+                    logger.error("Job '%s': %s", job["id"], error)
 
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but

@@ -1284,7 +1284,9 @@ def create_job(
                 injected into the agent's prompt as context (data-collection /
                 change-detection pattern). Paths resolve under
                 ~/.hermes/scripts/; ``.sh`` / ``.bash`` files run via bash,
-                anything else via Python.
+                anything else via Python. When ``workdir`` is set, the script
+                runs from that directory and receives it as
+                ``HERMES_CRON_WORKDIR``.
         context_from: Optional job ID (or list of job IDs) whose most recent output
                       is injected into the prompt as context before each run.
                       Useful for chaining cron jobs: job A finds data, job B processes it.
@@ -1298,9 +1300,8 @@ def create_job(
                 terminal/file/code_exec tools use it as their working directory
                 (via TERMINAL_CWD).  When unset, the old behaviour is preserved
                 (no context files injected, tools use the scheduler's cwd).
-                With ``no_agent=True``, ``workdir`` is still applied as the
-                script's cwd so relative paths inside the script behave
-                predictably.
+                ``workdir`` is also applied to the pre-run script's cwd so
+                relative paths inside the script behave predictably.
         no_agent: When True, skip the agent entirely — run ``script`` on schedule
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
