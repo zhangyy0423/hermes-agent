@@ -26,6 +26,53 @@ from cron.jobs import (
 )
 
 
+class TestSkillRequirementContract:
+    def test_create_persists_normalized_declared_requirements(self, tmp_cron_dir):
+        job = create_job(
+            prompt="run",
+            schedule="every 1h",
+            skills=["must", "may"],
+            skill_requirements={"required": ["must"], "optional": ["may"]},
+        )
+
+        assert job["skill_requirements"] == {
+            "required": ["must"],
+            "optional": ["may"],
+        }
+        assert get_job(job["id"])["skill_requirements"] == job["skill_requirements"]
+
+    @pytest.mark.parametrize(
+        "contract",
+        [
+            {"required": "must", "optional": []},
+            {"required": ["must", "must"], "optional": []},
+            {"required": ["must"], "optional": ["must"]},
+            {"required": ["must"], "optional": [], "unknown": []},
+            {"required": [], "optional": []},
+        ],
+    )
+    def test_create_rejects_malformed_skill_requirement_contract(self, tmp_cron_dir, contract):
+        with pytest.raises(ValueError, match="CRON_SKILL_CONTRACT_INVALID"):
+            create_job(
+                prompt="run",
+                schedule="every 1h",
+                skills=["must"],
+                skill_requirements=contract,
+            )
+
+    def test_update_rejects_declared_requirements_when_switching_to_no_agent(self, tmp_cron_dir):
+        job = create_job(
+            prompt="run",
+            schedule="every 1h",
+            script="watchdog.py",
+            skills=["must"],
+            skill_requirements={"required": ["must"], "optional": []},
+        )
+
+        with pytest.raises(ValueError, match="CRON_SKILL_CONTRACT_INVALID"):
+            update_job(job["id"], {"no_agent": True})
+
+
 # =========================================================================
 # parse_duration
 # =========================================================================

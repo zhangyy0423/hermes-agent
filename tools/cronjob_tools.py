@@ -562,6 +562,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "name": name,
         "skill": skills[0] if skills else None,
         "skills": skills,
+        "skill_requirements": job.get("skill_requirements"),
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
         "model": job.get("model"),
         "provider": job.get("provider"),
@@ -572,6 +573,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
+        "last_skill_load": job.get("last_skill_load"),
         "last_delivery_error": job.get("last_delivery_error"),
         "enabled": job.get("enabled", True),
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
@@ -718,6 +720,7 @@ def cronjob(
     include_disabled: bool = False,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
+    skill_requirements: Optional[Dict[str, List[str]]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -792,6 +795,7 @@ def cronjob(
                 deliver=_normalize_deliver_param(deliver),
                 origin=_origin_from_env(),
                 skills=canonical_skills,
+                skill_requirements=skill_requirements,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
@@ -926,6 +930,8 @@ def cronjob(
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
+            if skill_requirements is not None:
+                updates["skill_requirements"] = skill_requirements
             if model is not None:
                 updates["model"] = _normalize_optional_job_value(model)
             if provider is not None:
@@ -1079,6 +1085,31 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
             },
+            "skill_requirements": {
+                "type": "object",
+                "properties": {
+                    "required": {"type": "array", "items": {"type": "string"}},
+                    "optional": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["required", "optional"],
+                "additionalProperties": False,
+                "description": "Optional explicit classification for every attached skill. required and optional must be disjoint, individually unique arrays whose union exactly equals skills. Required missing skills block the run; optional missing skills continue with a degraded receipt. Not allowed for no_agent jobs.",
+            },
+            "model": {
+                "type": "object",
+                "description": "Optional per-job model override. If provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider name (e.g. 'openrouter', 'anthropic', or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
+                    }
+                },
+                "required": ["model"]
+            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
@@ -1178,6 +1209,7 @@ registry.register(
         # `hermes cron create/edit --model`, or hand-edited jobs). The agent
         # must not be able to point unattended spend at a different model.
         # Programmatic callers of cronjob() itself retain the parameters.
+        skill_requirements=args.get("skill_requirements"),
         reason=args.get("reason"),
         script=args.get("script"),
         context_from=args.get("context_from"),

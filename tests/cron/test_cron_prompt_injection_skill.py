@@ -240,6 +240,198 @@ class TestBuildJobPromptScansSkillContent:
         prompt = scheduler._build_job_prompt(job)
         assert prompt is not None
         assert "could not be found" in prompt
+        assert job["_skill_load"]["mode"] == "legacy"
+        assert job["_skill_load"]["code"] == "CRON_SKILL_LEGACY_UNCLASSIFIED"
+
+    def test_declared_required_missing_blocks_before_provider_or_agent(self, cron_env, monkeypatch):
+        """A declared required skill must fail closed before model setup.
+
+        Legacy jobs intentionally retain the soft-skip behavior above.  This
+        declared-contract case is different: the missing instruction changes
+        the work the autonomous job is authorized to perform, so it cannot
+        resolve a provider or construct an agent.
+        """
+        _, scheduler = cron_env
+        provider_calls = []
+        agent_inits = []
+
+        import hermes_cli.runtime_provider as runtime_provider
+        monkeypatch.setattr(
+            runtime_provider,
+            "resolve_runtime_provider",
+            lambda **kwargs: provider_calls.append(kwargs) or {
+                "provider": "test",
+                "api_key": "test-key",
+                "base_url": "http://test.invalid",
+                "api_mode": "chat_completions",
+            },
+        )
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                agent_inits.append(kwargs)
+
+            def run_conversation(self, _prompt):
+                return {"final_response": "unexpected", "messages": []}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 0.0}
+
+            def close(self):
+                return None
+
+        fake_run_agent = type(sys)("run_agent")
+        fake_run_agent.AIAgent = FakeAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        job = {
+            "id": "job-required-missing",
+            "name": "required missing",
+            "prompt": "run task",
+            "skills": ["does-not-exist"],
+            "skill_requirements": {
+                "required": ["does-not-exist"],
+                "optional": [],
+            },
+        }
+
+        success, output, final_response, error = scheduler.run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "CRON_SKILL_REQUIRED_MISSING" in (error or "")
+        assert "Skill load: BLOCKED" in output
+        assert provider_calls == []
+        assert agent_inits == []
+
+    def test_declared_optional_missing_is_explicitly_degraded(self, cron_env):
+        _, scheduler = cron_env
+        job = {
+            "id": "job-optional-missing",
+            "name": "optional missing",
+            "prompt": "run task",
+            "skills": ["does-not-exist"],
+            "skill_requirements": {
+                "required": [],
+                "optional": ["does-not-exist"],
+            },
+        }
+
+        prompt = scheduler._build_job_prompt(job)
+
+        assert prompt is not None
+        assert job["_skill_load"] == {
+            "mode": "declared",
+            "status": "degraded",
+            "loaded": [],
+            "missing_required": [],
+            "missing_optional": ["does-not-exist"],
+            "code": "CRON_SKILL_OPTIONAL_MISSING",
+        }
+
+    def test_declared_ready_skill_has_explicit_ready_receipt(self, cron_env):
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "ready-skill", "Ready guidance.")
+        job = {
+            "id": "job-ready-skill",
+            "name": "ready skill",
+            "prompt": "run task",
+            "skills": ["ready-skill"],
+            "skill_requirements": {"required": ["ready-skill"], "optional": []},
+        }
+
+        prompt = scheduler._build_job_prompt(job)
+
+        assert "Ready guidance." in prompt
+        assert job["_skill_load"] == {
+            "mode": "declared",
+            "status": "ready",
+            "loaded": ["ready-skill"],
+            "missing_required": [],
+            "missing_optional": [],
+            "code": None,
+        }
+
+    def test_declared_required_bundle_member_missing_blocks(self, cron_env):
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "present", "Present guidance.")
+        _plant_bundle(hermes_home, "pipeline", ["present", "missing-member"])
+        job = {
+            "id": "job-required-bundle-missing",
+            "name": "required bundle missing",
+            "prompt": "run task",
+            "skills": ["pipeline"],
+            "skill_requirements": {"required": ["pipeline"], "optional": []},
+        }
+
+        with pytest.raises(scheduler.CronSkillRequiredMissing) as exc_info:
+            scheduler._build_job_prompt(job)
+
+        assert exc_info.value.missing == ["missing-member"]
+
+    def test_declared_optional_bundle_member_missing_degrades(self, cron_env):
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "present", "Present guidance.")
+        _plant_bundle(hermes_home, "pipeline", ["present", "missing-member"])
+        job = {
+            "id": "job-optional-bundle-missing",
+            "name": "optional bundle missing",
+            "prompt": "run task",
+            "skills": ["pipeline"],
+            "skill_requirements": {"required": [], "optional": ["pipeline"]},
+        }
+
+        prompt = scheduler._build_job_prompt(job)
+
+        assert "Present guidance." in prompt
+        assert job["_skill_load"]["status"] == "degraded"
+        assert job["_skill_load"]["missing_optional"] == ["missing-member"]
+
+    def test_run_one_job_persists_blocked_skill_readback_and_output(self, cron_env):
+        hermes_home, scheduler = cron_env
+        from cron.jobs import create_job, get_job
+
+        job = create_job(
+            prompt="run task",
+            schedule="every 1h",
+            deliver="local",
+            skills=["does-not-exist"],
+            skill_requirements={"required": ["does-not-exist"], "optional": []},
+        )
+
+        assert scheduler.run_one_job(job) is True
+
+        stored = get_job(job["id"])
+        assert stored["last_status"] == "error"
+        assert stored["last_skill_load"]["status"] == "blocked"
+        assert stored["last_skill_load"]["missing_required"] == ["does-not-exist"]
+        outputs = sorted((hermes_home / "cron" / "output" / job["id"]).glob("*.md"))
+        assert len(outputs) == 1
+        assert "Skill load: BLOCKED" in outputs[0].read_text(encoding="utf-8")
+
+    def test_persisted_no_agent_declared_contract_blocks_before_script(self, cron_env, monkeypatch):
+        _, scheduler = cron_env
+        script_calls = []
+        monkeypatch.setattr(
+            scheduler,
+            "_run_job_script_with_claim_heartbeat",
+            lambda *_args, **_kwargs: script_calls.append(True) or (True, "unexpected"),
+        )
+
+        success, output, final_response, error = scheduler.run_job({
+            "id": "job-no-agent-contract",
+            "name": "no agent contract",
+            "no_agent": True,
+            "script": "watchdog.py",
+            "skills": ["must"],
+            "skill_requirements": {"required": ["must"], "optional": []},
+        })
+
+        assert success is False
+        assert final_response == ""
+        assert "CRON_SKILL_CONTRACT_INVALID" in (error or "")
+        assert "Skill load: BLOCKED" in output
+        assert script_calls == []
 
 
     def test_bundle_name_shadows_skill_name_for_cron_jobs(self, cron_env):

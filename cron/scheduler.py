@@ -50,6 +50,12 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
+from cron.jobs import (
+    CRON_SKILL_CONTRACT_INVALID,
+    CronSkillContractInvalid,
+    normalize_skill_requirements,
+    set_job_skill_load,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +167,64 @@ class CronPromptInjectionBlocked(Exception):
 
 class CronPrerequisiteFailed(Exception):
     """Raised when a job declares its pre-run script as a hard prerequisite."""
+
+
+CRON_SKILL_LEGACY_UNCLASSIFIED = "CRON_SKILL_LEGACY_UNCLASSIFIED"
+CRON_SKILL_OPTIONAL_MISSING = "CRON_SKILL_OPTIONAL_MISSING"
+CRON_SKILL_REQUIRED_MISSING = "CRON_SKILL_REQUIRED_MISSING"
+
+
+class CronSkillRequiredMissing(Exception):
+    """A declared required skill or bundle member could not be loaded."""
+
+    code = CRON_SKILL_REQUIRED_MISSING
+
+    def __init__(self, missing: list[str]):
+        self.missing = missing
+        super().__init__(f"{self.code}: required skill(s) missing: {', '.join(missing)}")
+
+
+def _record_skill_load(job: dict, skill_load: dict) -> None:
+    """Attach and best-effort persist the receipt used by list/run readback."""
+    job["_skill_load"] = skill_load
+    job["last_skill_load"] = skill_load
+    try:
+        set_job_skill_load(str(job.get("id") or ""), skill_load)
+    except Exception:
+        logger.debug("Job '%s': failed to persist skill load receipt", job.get("id"), exc_info=True)
+
+
+def _skill_load_markdown(skill_load: Optional[dict]) -> str:
+    """Render the durable skill receipt into cron output Markdown."""
+    if not skill_load:
+        return ""
+    def _names(key: str) -> str:
+        values = skill_load.get(key) or []
+        return ", ".join(str(value) for value in values) if values else "(none)"
+
+    return (
+        "## Skill Load\n\n"
+        f"Skill load: {str(skill_load.get('status') or 'unknown').upper()}\n\n"
+        f"- Mode: {skill_load.get('mode') or 'unknown'}\n"
+        f"- Loaded: {_names('loaded')}\n"
+        f"- Missing required: {_names('missing_required')}\n"
+        f"- Missing optional: {_names('missing_optional')}\n"
+        f"- Code: {skill_load.get('code') or '(none)'}\n"
+    )
+
+
+def _skill_blocked_result(job: dict, skill_load: dict, error: str) -> tuple[bool, str, str, str]:
+    """Return the uniform fail-closed result for a rejected skill contract."""
+    job_id = job.get("id") or "unknown"
+    job_name = job.get("name") or job.get("prompt") or job_id
+    return (
+        False,
+        f"# Cron Job: {job_name} (FAILED)\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Status:** BLOCKED\n\n{_skill_load_markdown(skill_load)}\n{error}\n",
+        "",
+        error,
+    )
 
 
 def _write_job_artifact(job: dict, final_response: str) -> Path:
@@ -2684,8 +2748,22 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
     from agent.skill_utils import normalize_skill_lookup_name
 
+    requirements = normalize_skill_requirements(
+        job.get("skill_requirements"), skill_names
+    )
+
+    mode = "declared" if requirements is not None else "legacy"
+    required_names = set(requirements.get("required", [])) if requirements else set()
     parts = []
     skipped: list[str] = []
+    loaded_names: list[str] = []
+    missing_required: list[str] = []
+    missing_optional: list[str] = []
+
+    def note_missing(name: str, parent_skill: str) -> None:
+        target = missing_required if parent_skill in required_names else missing_optional
+        if name not in target:
+            target.append(name)
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -2699,10 +2777,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 task_id=str(job.get("id") or "") or None,
             )
             if bundle_payload:
-                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
+                bundle_message, bundle_loaded_skills, missing_bundle_skills = bundle_payload
                 if parts:
                     parts.append("")
                 parts.append(bundle_message)
+                for loaded_name in bundle_loaded_skills:
+                    if loaded_name not in loaded_names:
+                        loaded_names.append(loaded_name)
+                for missing_name in missing_bundle_skills:
+                    note_missing(missing_name, skill_name)
                 continue
             logger.warning(
                 "Cron job '%s': bundle '%s' could not load any skills, skipping",
@@ -2710,6 +2793,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 skill_name,
             )
             skipped.append(skill_name)
+            note_missing(skill_name, skill_name)
             continue
 
         try:
@@ -2717,11 +2801,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
+            note_missing(skill_name, skill_name)
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
+            note_missing(skill_name, skill_name)
             continue
 
         # Bump usage so the curator sees this skill as actively used.
@@ -2731,6 +2817,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
         content = str(loaded.get("content") or "").strip()
+        if skill_name not in loaded_names:
+            loaded_names.append(skill_name)
         if parts:
             parts.append("")
         parts.extend(
@@ -2749,6 +2837,37 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
         )
         parts.insert(0, notice)
+
+    if mode == "declared":
+        if missing_required:
+            skill_load = {
+                "mode": mode,
+                "status": "blocked",
+                "loaded": loaded_names,
+                "missing_required": missing_required,
+                "missing_optional": missing_optional,
+                "code": CRON_SKILL_REQUIRED_MISSING,
+            }
+            job["_skill_load"] = skill_load
+            raise CronSkillRequiredMissing(missing_required)
+        skill_load = {
+            "mode": mode,
+            "status": "degraded" if missing_optional else "ready",
+            "loaded": loaded_names,
+            "missing_required": [],
+            "missing_optional": missing_optional,
+            "code": CRON_SKILL_OPTIONAL_MISSING if missing_optional else None,
+        }
+    else:
+        skill_load = {
+            "mode": mode,
+            "status": "degraded" if skipped else "ready",
+            "loaded": loaded_names,
+            "missing_required": [],
+            "missing_optional": skipped,
+            "code": CRON_SKILL_LEGACY_UNCLASSIFIED,
+        }
+    job["_skill_load"] = skill_load
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
@@ -2893,6 +3012,34 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    raw_skills = job.get("skills")
+    if raw_skills is None:
+        raw_skills = [job.get("skill")] if job.get("skill") else []
+    elif isinstance(raw_skills, str):
+        raw_skills = [raw_skills]
+    skill_names = []
+    for raw_skill in raw_skills:
+        name = str(raw_skill or "").strip()
+        if name and name not in skill_names:
+            skill_names.append(name)
+
+    try:
+        declared_requirements = normalize_skill_requirements(
+            job.get("skill_requirements"), skill_names
+        )
+    except CronSkillContractInvalid as exc:
+        skill_load = {
+            "mode": "declared",
+            "status": "blocked",
+            "loaded": [],
+            "missing_required": [],
+            "missing_optional": [],
+            "code": CRON_SKILL_CONTRACT_INVALID,
+        }
+        _record_skill_load(job, skill_load)
+        error = str(exc)
+        return _skill_blocked_result(job, skill_load, error)
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -2912,6 +3059,29 @@ def run_job(
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
     if job.get("no_agent"):
+        if declared_requirements is not None:
+            error = (
+                f"{CRON_SKILL_CONTRACT_INVALID}: no_agent jobs cannot declare "
+                "skill_requirements because they do not load skills"
+            )
+            skill_load = {
+                "mode": "declared",
+                "status": "blocked",
+                "loaded": [],
+                "missing_required": [],
+                "missing_optional": [],
+                "code": CRON_SKILL_CONTRACT_INVALID,
+            }
+            _record_skill_load(job, skill_load)
+            return _skill_blocked_result(job, skill_load, error)
+        _record_skill_load(job, {
+            "mode": "legacy",
+            "status": "not_applicable",
+            "loaded": [],
+            "missing_required": [],
+            "missing_optional": [],
+            "code": CRON_SKILL_LEGACY_UNCLASSIFIED,
+        })
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
@@ -3003,8 +3173,6 @@ def run_job(
     # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
     # construction costs.
     # ---------------------------------------------------------------
-    from run_agent import AIAgent
-
     # Initialize SQLite session store so cron job messages are persisted
     # and discoverable via session_search (same pattern as gateway/run.py).
     #
@@ -3096,6 +3264,38 @@ def run_job(
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        _record_skill_load(job, job.get("_skill_load") or {
+            "mode": "legacy",
+            "status": "ready",
+            "loaded": [],
+            "missing_required": [],
+            "missing_optional": [],
+            "code": CRON_SKILL_LEGACY_UNCLASSIFIED,
+        })
+    except CronSkillRequiredMissing as missing_exc:
+        skill_load = job.get("_skill_load") or {
+            "mode": "declared",
+            "status": "blocked",
+            "loaded": [],
+            "missing_required": missing_exc.missing,
+            "missing_optional": [],
+            "code": CRON_SKILL_REQUIRED_MISSING,
+        }
+        _record_skill_load(job, skill_load)
+        error = str(missing_exc)
+        return _skill_blocked_result(job, skill_load, error)
+    except CronSkillContractInvalid as contract_exc:
+        skill_load = {
+            "mode": "declared",
+            "status": "blocked",
+            "loaded": [],
+            "missing_required": [],
+            "missing_optional": [],
+            "code": CRON_SKILL_CONTRACT_INVALID,
+        }
+        _record_skill_load(job, skill_load)
+        error = str(contract_exc)
+        return _skill_blocked_result(job, skill_load, error)
     except CronPrerequisiteFailed as prerequisite_exc:
         logger.warning(
             "Job '%s' (ID: %s): prerequisite failed — %s",
@@ -3611,6 +3811,8 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        from run_agent import AIAgent
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -3851,6 +4053,8 @@ def run_job(
 
 {prompt}
 
+{_skill_load_markdown(job.get("_skill_load"))}
+
 ## Response
 
 {logged_response}
@@ -3872,6 +4076,8 @@ def run_job(
 ## Prompt
 
 {prompt}
+
+{_skill_load_markdown(job.get("_skill_load"))}
 
 ## Error
 

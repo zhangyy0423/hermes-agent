@@ -344,6 +344,100 @@ class TestUnifiedCronjobTool:
         assert result["success"] is True
         assert result["job"]["base_url"] == "https://legit.example/v1"
 
+    def test_create_skill_backed_job(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                skill="blogwatcher",
+                prompt="Check the configured feeds and summarize anything new.",
+                schedule="every 1h",
+                name="Morning feeds",
+            )
+        )
+        assert result["success"] is True
+        assert result["skill"] == "blogwatcher"
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["skill"] == "blogwatcher"
+
+    def test_create_multi_skill_job(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                skills=["blogwatcher", "maps"],
+                prompt="Use both skills and combine the result.",
+                schedule="every 1h",
+                name="Combo job",
+            )
+        )
+        assert result["success"] is True
+        assert result["skills"] == ["blogwatcher", "maps"]
+
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["skills"] == ["blogwatcher", "maps"]
+
+    def test_create_declared_skill_requirements_are_echoed(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Use the declared skills.",
+                schedule="every 1h",
+                skills=["blogwatcher", "maps"],
+                skill_requirements={
+                    "required": ["blogwatcher"],
+                    "optional": ["maps"],
+                },
+            )
+        )
+
+        assert result["success"] is True
+        assert result["job"]["skill_requirements"] == {
+            "required": ["blogwatcher"],
+            "optional": ["maps"],
+        }
+
+    def test_create_no_agent_rejects_declared_skill_requirements(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 1h",
+                script="watchdog.py",
+                no_agent=True,
+                skills=["blogwatcher"],
+                skill_requirements={"required": ["blogwatcher"], "optional": []},
+            )
+        )
+
+        assert result["success"] is False
+        assert "CRON_SKILL_CONTRACT_INVALID" in result["error"]
+
+    def test_multi_skill_default_name_prefers_prompt_when_present(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                skills=["blogwatcher", "maps"],
+                prompt="Use both skills and combine the result.",
+                schedule="every 1h",
+            )
+        )
+        assert result["success"] is True
+        assert result["name"] == "Use both skills and combine the result."
+
+    def test_update_can_clear_skills(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                skills=["blogwatcher", "maps"],
+                prompt="Use both skills and combine the result.",
+                schedule="every 1h",
+            )
+        )
+        updated = json.loads(
+            cronjob(action="update", job_id=created["job_id"], skills=[])
+        )
+        assert updated["success"] is True
+        assert updated["job"]["skills"] == []
+        assert updated["job"]["skill"] is None
 
     def test_create_normalizes_list_form_deliver(self):
         """deliver=['telegram'] (list) is stored as the string 'telegram'.

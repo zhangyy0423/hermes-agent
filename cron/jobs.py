@@ -38,6 +38,18 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
+
+CRON_SKILL_CONTRACT_INVALID = "CRON_SKILL_CONTRACT_INVALID"
+
+
+class CronSkillContractInvalid(ValueError):
+    """A declared cron skill requirement is malformed or incompatible."""
+
+    code = CRON_SKILL_CONTRACT_INVALID
+
+    def __init__(self, detail: str):
+        super().__init__(f"{self.code}: {detail}")
+
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
 
@@ -401,6 +413,57 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         text = str(item or "").strip()
         if text and text not in normalized:
             normalized.append(text)
+    return normalized
+
+
+def normalize_skill_requirements(
+    skill_requirements: Any,
+    skills: List[str],
+) -> Optional[Dict[str, List[str]]]:
+    """Validate and normalize an explicit cron skill loading contract.
+
+    An omitted contract deliberately preserves legacy soft-skip behavior.  A
+    declared contract must classify every normalized job skill exactly once so
+    the scheduler can fail closed for required instructions and report optional
+    degradation without guessing.
+    """
+    if skill_requirements is None:
+        return None
+    if not isinstance(skill_requirements, dict):
+        raise CronSkillContractInvalid("skill_requirements must be an object")
+    expected_keys = {"required", "optional"}
+    if set(skill_requirements) != expected_keys:
+        raise CronSkillContractInvalid(
+            "skill_requirements must contain exactly required and optional"
+        )
+
+    normalized: Dict[str, List[str]] = {}
+    for key in ("required", "optional"):
+        values = skill_requirements.get(key)
+        if not isinstance(values, list):
+            raise CronSkillContractInvalid(f"skill_requirements.{key} must be an array of strings")
+        names: List[str] = []
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise CronSkillContractInvalid(
+                    f"skill_requirements.{key} must contain non-empty strings"
+                )
+            name = value.strip()
+            if name in names:
+                raise CronSkillContractInvalid(
+                    f"skill_requirements.{key} must not contain duplicates"
+                )
+            names.append(name)
+        normalized[key] = names
+
+    required = set(normalized["required"])
+    optional = set(normalized["optional"])
+    if required & optional:
+        raise CronSkillContractInvalid("required and optional skills must not overlap")
+    if required | optional != set(skills):
+        raise CronSkillContractInvalid(
+            "required and optional skills must exactly classify normalized skills"
+        )
     return normalized
 
 
@@ -1252,6 +1315,7 @@ def create_job(
     origin: Optional[Dict[str, Any]] = None,
     skill: Optional[str] = None,
     skills: Optional[List[str]] = None,
+    skill_requirements: Optional[Dict[str, List[str]]] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
@@ -1328,6 +1392,9 @@ def create_job(
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
+    normalized_skill_requirements = normalize_skill_requirements(
+        skill_requirements, normalized_skills
+    )
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
@@ -1346,6 +1413,10 @@ def create_job(
         raise ValueError(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
+        )
+    if normalized_no_agent and normalized_skill_requirements is not None:
+        raise CronSkillContractInvalid(
+            "no_agent jobs cannot declare skill_requirements because they do not load skills"
         )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -1422,12 +1493,15 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "last_skill_load": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_skill_requirements is not None:
+        job["skill_requirements"] = normalized_skill_requirements
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1542,6 +1616,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            if "skill_requirements" in updates:
+                if updates["skill_requirements"] is None:
+                    updated.pop("skill_requirements", None)
+                else:
+                    updated["skill_requirements"] = normalize_skill_requirements(
+                        updates["skill_requirements"], updated["skills"]
+                    )
+            elif updated.get("skill_requirements") is not None:
+                updated["skill_requirements"] = normalize_skill_requirements(
+                    updated["skill_requirements"], updated["skills"]
+                )
+
+            if updated.get("no_agent") and updated.get("skill_requirements") is not None:
+                raise CronSkillContractInvalid(
+                    "no_agent jobs cannot declare skill_requirements because they do not load skills"
+                )
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
@@ -1835,6 +1926,18 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
             "Failed to write wedged-oneshot diagnostic for job %r: %s",
             job.get("id"), e,
         )
+
+
+def set_job_skill_load(job_id: str, skill_load: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Persist a cron skill-load receipt without changing run status fields."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") == job_id:
+                job["last_skill_load"] = copy.deepcopy(skill_load)
+                _save_jobs_unlocked(jobs)
+                return copy.deepcopy(job)
+    return None
 
 
 def claim_dispatch(job_id: str) -> bool:
