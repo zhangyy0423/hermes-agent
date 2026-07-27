@@ -189,6 +189,18 @@ def test_required_all_missing_is_dropped():
     assert "required" not in out[0]["function"]["parameters"]
 
 
+def test_null_required_is_dropped():
+    tools = [_tool("mcp_list", {
+        "type": "object",
+        "properties": {"calendar": {"type": "string"}},
+        "required": None,
+    })]
+
+    out = sanitize_tool_schemas(tools)
+
+    assert "required" not in out[0]["function"]["parameters"]
+
+
 def test_well_formed_schema_unchanged():
     schema = {
         "type": "object",

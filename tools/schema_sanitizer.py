@@ -415,7 +415,9 @@ def _sanitize_node(node: Any, path: str) -> Any:
             # literal strings like "path" as bare-string schemas and replace
             # them with {"type": "object"} dicts. Pass through unchanged
             # (remapping ``required`` entries through the property renames).
-            if key == "required" and prop_renames and isinstance(value, list):
+            if key == "required" and not isinstance(value, list):
+                continue
+            if key == "required" and prop_renames:
                 out[key] = [prop_renames.get(r, r) if isinstance(r, str) else r
                             for r in value]
             else:
