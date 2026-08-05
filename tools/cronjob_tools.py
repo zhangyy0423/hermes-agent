@@ -1095,21 +1095,6 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "additionalProperties": False,
                 "description": "Optional explicit classification for every attached skill. required and optional must be disjoint, individually unique arrays whose union exactly equals skills. Required missing skills block the run; optional missing skills continue with a degraded receipt. Not allowed for no_agent jobs.",
             },
-            "model": {
-                "type": "object",
-                "description": "Optional per-job model override. If provider is omitted, the current main provider is pinned at creation time so the job stays stable.",
-                "properties": {
-                    "provider": {
-                        "type": "string",
-                        "description": "Provider name (e.g. 'openrouter', 'anthropic', or 'custom:<name>' for a provider defined in custom_providers config — always include the ':<name>' suffix, never pass the bare 'custom'). Omit to use and pin the current provider."
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Model name (e.g. 'anthropic/claude-sonnet-4', 'claude-sonnet-4')"
-                    }
-                },
-                "required": ["model"]
-            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."

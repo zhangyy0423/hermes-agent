@@ -39,6 +39,8 @@ def test_cronjob_schema_required_array_unchanged():
     from tools.cronjob_tools import CRONJOB_SCHEMA
 
     assert CRONJOB_SCHEMA["parameters"]["required"] == ["action"]
+
+
 def test_cronjob_schema_exposes_declared_skill_requirements():
     from tools.cronjob_tools import CRONJOB_SCHEMA
 
