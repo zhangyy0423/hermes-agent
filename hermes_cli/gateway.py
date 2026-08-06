@@ -4530,6 +4530,23 @@ def _wait_for_gateway_exit(
     return True
 
 
+def _wait_for_launchd_service_restart(
+    previous_pid: int, timeout: float = 30.0
+) -> bool:
+    """Wait until launchd publishes a replacement gateway PID."""
+    import time
+    from gateway.status import get_running_pid
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while time.monotonic() < deadline:
+        pid = get_running_pid(cleanup_stale=False)
+        if pid is not None and pid != previous_pid:
+            print(f"✓ Service restarted (PID {pid})")
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
@@ -4543,6 +4560,26 @@ def launchd_restart():
             _clear_launchd_unsupported_marker()
             return
         if pid is not None:
+            wait_budget = _get_restart_exit_wait_budget()
+            print(
+                f"⏳ Launchd service restarting gracefully (PID {pid}) — "
+                f"waiting up to {wait_budget:.0f}s for in-flight turns + drain..."
+            )
+            if _graceful_restart_via_sigusr1(pid, wait_budget):
+                if not _wait_for_launchd_service_restart(pid):
+                    # KeepAlive normally relaunches immediately. If it did not,
+                    # ask launchd to start the now-stopped service without -k;
+                    # using -k here could kill a replacement that appeared in
+                    # the small race between the wait and this command.
+                    subprocess.run(
+                        ["launchctl", "kickstart", target],
+                        check=True,
+                        timeout=90,
+                    )
+                    _wait_for_launchd_service_restart(pid)
+                _clear_launchd_unsupported_marker()
+                return
+
             # Announce the drain BEFORE waiting on it. This wait can run for
             # the full drain budget (180s by default) while the old gateway
             # finishes in-flight agent runs, and it streams into surfaces with

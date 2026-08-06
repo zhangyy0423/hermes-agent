@@ -539,6 +539,50 @@ class TestGatewaySystemServiceRouting:
         assert "21627" not in out  # must use the mocked budget, not live defaults
         assert "27" in out
 
+    def test_launchd_restart_uses_drain_aware_sigusr1_for_sibling_service(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_restart",
+            lambda previous_pid, timeout=30.0: calls.append(
+                ("wait", previous_pid, timeout)
+            )
+            or True,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda *_args, **_kwargs: pytest.fail("must not SIGTERM a graceful restart"),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(("run", cmd))
+            or SimpleNamespace(returncode=0),
+        )
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+
+        gateway_cli.launchd_restart()
+
+        assert ("graceful", 654, 27.0) in calls
+        assert ("wait", 654, 30.0) in calls
+        assert not any(call[0] == "run" and "-k" in call[1] for call in calls)
+        assert "restarting gracefully" in capsys.readouterr().out.lower()
+
 
 
 
@@ -1759,4 +1803,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-

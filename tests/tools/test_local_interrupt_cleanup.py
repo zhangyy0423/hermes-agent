@@ -35,8 +35,20 @@ def _pgid_still_alive(pgid: int) -> bool:
     try:
         os.killpg(pgid, 0)  # signal 0 = existence check
         return True
+    except PermissionError:
+        # POSIX EPERM means the process group exists but is not signalable.
+        return True
     except ProcessLookupError:
         return False
+
+
+def test_pgid_probe_permission_error_means_group_exists(monkeypatch):
+    def _permission_denied(_pgid, _sig):
+        raise PermissionError
+
+    monkeypatch.setattr(os, "killpg", _permission_denied)
+
+    assert _pgid_still_alive(12345) is True
 
 
 def _process_group_snapshot(pgid: int) -> str:

@@ -2164,9 +2164,27 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = os.path.normpath(os.path.abspath(tempfile.gettempdir()))
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+
+    # macOS exposes its system temp roots through stable symlink aliases
+    # (/tmp -> /private/tmp and /var/folders -> /private/var/folders). Tempfile
+    # returns the alias path, while the safety check below uses the canonical
+    # target. Accept only those OS-owned aliases; arbitrary symlinked temp dirs
+    # must still use the canonical target so TMPDIR cannot redirect deletion.
+    allowed_dirs = {temp_dir}
+    if sys.platform == "darwin" and (
+        (raw_temp_dir == "/tmp" and temp_dir == "/private/tmp")
+        or (
+            raw_temp_dir.startswith("/var/folders/")
+            and temp_dir == f"/private{raw_temp_dir}"
+        )
+    ):
+        allowed_dirs.add(raw_temp_dir)
+
+    operand_dir = os.path.dirname(operand)
+    if operand_dir not in allowed_dirs or operand != os.path.join(operand_dir, basename):
         return False
 
     target = os.path.realpath(operand)
