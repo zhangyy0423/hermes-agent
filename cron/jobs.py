@@ -1697,6 +1697,47 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def consume_dependency_event(
+    job_id: str, event_id: str, execution_id: str
+) -> Optional[Dict[str, Any]]:
+    """Atomically consume one exact ready dependency event.
+
+    The persisted state is the cross-process claim: after it changes from
+    ``ready`` to ``consumed``, restarts and manual re-triggers cannot reuse the
+    same upstream completion event.
+    """
+    job_id = str(job_id or "").strip()
+    event_id = str(event_id or "").strip()
+    execution_id = str(execution_id or "").strip()
+    if not job_id or not event_id or not execution_id:
+        return None
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            event = job.get("dependency_event")
+            if (
+                not isinstance(event, dict)
+                or event.get("id") != event_id
+                or event.get("state") != "ready"
+            ):
+                return None
+            consumed = copy.deepcopy(event)
+            consumed.update(
+                {
+                    "state": "consumed",
+                    "consumed_by_execution_id": execution_id,
+                    "consumed_at": _hermes_now().isoformat(),
+                }
+            )
+            job["dependency_event"] = consumed
+            _save_jobs_unlocked(jobs)
+            return copy.deepcopy(consumed)
+    return None
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)

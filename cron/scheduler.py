@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -34,6 +36,7 @@ except ImportError:
         msvcrt = None
 from pathlib import Path
 from typing import Any, List, Optional
+from zoneinfo import ZoneInfo
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -172,6 +175,7 @@ class CronPrerequisiteFailed(Exception):
 CRON_SKILL_LEGACY_UNCLASSIFIED = "CRON_SKILL_LEGACY_UNCLASSIFIED"
 CRON_SKILL_OPTIONAL_MISSING = "CRON_SKILL_OPTIONAL_MISSING"
 CRON_SKILL_REQUIRED_MISSING = "CRON_SKILL_REQUIRED_MISSING"
+_MAX_CRON_JOB_ITERATIONS = 10_000
 
 
 class CronSkillRequiredMissing(Exception):
@@ -467,8 +471,8 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.jobs import consume_dependency_event, get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim, load_jobs, update_job
+from cron.executions import create_execution, finish_execution, latest_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3021,6 +3025,23 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
+    """Resolve the agent budget, preferring an explicit per-job override."""
+    if "max_iterations" in job:
+        value = job["max_iterations"]
+        if type(value) is not int or not 1 <= value <= _MAX_CRON_JOB_ITERATIONS:
+            raise ValueError(
+                "job.max_iterations must be an integer between "
+                f"1 and {_MAX_CRON_JOB_ITERATIONS}"
+            )
+        return value
+
+    cfg = cfg if isinstance(cfg, dict) else {}
+    agent_cfg = cfg.get("agent")
+    agent_cfg = agent_cfg if isinstance(agent_cfg, dict) else {}
+    return agent_cfg.get("max_turns") or cfg.get("max_turns") or 500
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3628,8 +3649,9 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # An explicit job budget is for bounded heavyweight producers. Jobs
+        # without one preserve the existing global agent.max_turns behavior.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -4031,19 +4053,40 @@ def run_job(
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if max_iteration_summary:
+            error_msg = (
+                f"Agent exhausted its iteration budget: {turn_exit_reason}; "
+                "incomplete fallback saved only in cron run output"
+            )
+            logger.error("Job '%s' failed: %s", job_name, error_msg)
+            output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+{_skill_load_markdown(job.get("_skill_load"))}
+
+## Error
+
+{error_msg}
+
+## Incomplete Fallback (diagnostic only; not delivered)
+
+{final_response_text}
+"""
+            return False, output, "", error_msg
+        if result.get("failed") is True or result.get("completed") is False:
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
-            logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
-            )
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
@@ -4251,6 +4294,281 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+_DEPENDENCY_EVENT_SCHEMA = "hermes.cron.dependency-event.v1"
+_DEPENDENCY_VALIDATOR = "sha256_readback_v1"
+
+
+def _dependency_business_date(execution: dict, timezone_name: str) -> str:
+    """Return the run-start business date, rejecting stale or naive timestamps."""
+    try:
+        timezone_value = ZoneInfo(timezone_name)
+    except Exception as exc:
+        raise ValueError(f"invalid dependency timezone: {timezone_name!r}") from exc
+
+    claimed_at = execution.get("claimed_at")
+    if not isinstance(claimed_at, str):
+        raise ValueError("upstream execution is missing claimed_at")
+    try:
+        claimed = datetime.fromisoformat(claimed_at)
+    except ValueError as exc:
+        raise ValueError("upstream execution claimed_at is invalid") from exc
+    if claimed.tzinfo is None:
+        raise ValueError("upstream execution claimed_at must be timezone-aware")
+
+    business_date = claimed.astimezone(timezone_value).date()
+    now = _hermes_now()
+    if now.tzinfo is None:
+        raise ValueError("scheduler time must be timezone-aware")
+    if business_date != now.astimezone(timezone_value).date():
+        raise ValueError("upstream execution business date is stale")
+    return business_date.isoformat()
+
+
+def _read_dependency_artifact(
+    upstream_job: dict, dependency: dict, business_date: str
+) -> dict:
+    """Read a same-date artifact once and return its stable SHA readback."""
+    if dependency.get("validator") != _DEPENDENCY_VALIDATOR:
+        raise ValueError(
+            f"dependency validator must be {_DEPENDENCY_VALIDATOR!r}"
+        )
+
+    raw_workdir = str(upstream_job.get("workdir") or "").strip()
+    if not raw_workdir:
+        raise ValueError("upstream workdir is required")
+    workdir = Path(raw_workdir).expanduser().resolve()
+    if not workdir.is_dir():
+        raise ValueError("upstream workdir is not an existing directory")
+
+    template = str(dependency.get("artifact_path") or "").strip()
+    if template.count("{business_date}") != 1:
+        raise ValueError(
+            "dependency artifact_path must contain one {business_date} placeholder"
+        )
+    relative_path = Path(template.replace("{business_date}", business_date))
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("dependency artifact_path must stay inside upstream workdir")
+
+    target = workdir / relative_path
+    if target.is_symlink():
+        raise ValueError("dependency artifact must not be a symlink")
+    try:
+        resolved = target.resolve(strict=True)
+        resolved.relative_to(workdir)
+    except (OSError, ValueError) as exc:
+        raise ValueError("dependency artifact is missing or outside upstream workdir") from exc
+    if not resolved.is_file():
+        raise ValueError("dependency artifact is not a regular file")
+
+    minimum_bytes = dependency.get("artifact_min_bytes", 1)
+    if type(minimum_bytes) is not int or minimum_bytes < 1:
+        raise ValueError("dependency artifact_min_bytes must be a positive integer")
+
+    before = resolved.stat()
+    payload = resolved.read_bytes()
+    after = resolved.stat()
+    before_identity = (before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_ino, after.st_size, after.st_mtime_ns)
+    if before_identity != after_identity:
+        raise ValueError("dependency artifact changed during readback")
+    if len(payload) < minimum_bytes:
+        raise ValueError("dependency artifact is smaller than artifact_min_bytes")
+
+    return {
+        "path": str(resolved),
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _dependency_event_id(event_identity: dict) -> str:
+    encoded = json.dumps(
+        event_identity,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _queue_one_hop_dependents(upstream_job: dict, execution: dict) -> int:
+    """Persist one validated completion event and make its consumer due."""
+    upstream_id = str(upstream_job.get("id") or "")
+    if not upstream_id or upstream_job.get("depends_on"):
+        return 0
+    if (
+        not isinstance(execution, dict)
+        or execution.get("job_id") != upstream_id
+        or execution.get("status") != "completed"
+        or not execution.get("id")
+    ):
+        return 0
+
+    latest = latest_execution(upstream_id)
+    if (
+        not isinstance(latest, dict)
+        or latest.get("id") != execution.get("id")
+        or latest.get("status") != "completed"
+    ):
+        logger.warning(
+            "Job '%s': dependency event rejected because execution %r is not latest completed",
+            upstream_id,
+            execution.get("id"),
+        )
+        return 0
+
+    jobs = load_jobs()
+    dependents = []
+    for candidate in jobs:
+        dependency = candidate.get("depends_on")
+        if not isinstance(dependency, dict):
+            continue
+        if dependency.get("upstream_job_id") != upstream_id:
+            continue
+        if dependency.get("mode") != "success_artifact":
+            continue
+        dependents.append((candidate, dependency))
+
+    if not dependents:
+        return 0
+    if len(dependents) != 1:
+        logger.error(
+            "Job '%s': one-hop dependency requires exactly one downstream; found %d",
+            upstream_id,
+            len(dependents),
+        )
+        return 0
+
+    downstream, dependency = dependents[0]
+    if not downstream.get("enabled", True) or downstream.get("state") == "paused":
+        logger.warning(
+            "Job '%s': downstream '%s' is paused or disabled; event not queued",
+            upstream_id,
+            downstream.get("id"),
+        )
+        return 0
+
+    try:
+        timezone_name = str(dependency.get("timezone") or "").strip()
+        business_date = _dependency_business_date(execution, timezone_name)
+        artifact = _read_dependency_artifact(
+            upstream_job, dependency, business_date
+        )
+    except (OSError, ValueError) as exc:
+        logger.error(
+            "Job '%s': dependency event validation failed: %s",
+            upstream_id,
+            exc,
+        )
+        return 0
+
+    identity = {
+        "schema": _DEPENDENCY_EVENT_SCHEMA,
+        "upstream_job_id": upstream_id,
+        "upstream_run_id": str(execution["id"]),
+        "downstream_job_id": str(downstream.get("id") or ""),
+        "business_date": business_date,
+        "artifact_sha256": artifact["sha256"],
+        "validator_name": _DEPENDENCY_VALIDATOR,
+        "validator_status": "passed",
+    }
+    event_id = _dependency_event_id(identity)
+    current_event = downstream.get("dependency_event")
+    if isinstance(current_event, dict) and current_event.get("id") == event_id:
+        return 0
+
+    event = {
+        **identity,
+        "id": event_id,
+        "state": "ready",
+        "artifact_path": artifact["path"],
+        "artifact_size": artifact["size"],
+        "validator": {
+            "name": _DEPENDENCY_VALIDATOR,
+            "status": "passed",
+        },
+        "created_at": _hermes_now().isoformat(),
+    }
+    updated = update_job(
+        str(downstream.get("id") or ""),
+        {
+            "dependency_event": event,
+            "next_run_at": _hermes_now().isoformat(),
+        },
+    )
+    if updated is None:
+        logger.error(
+            "Job '%s': downstream disappeared before dependency event persisted",
+            upstream_id,
+        )
+        return 0
+    logger.info(
+        "Job '%s': queued dependency event %s for downstream '%s'",
+        upstream_id,
+        event_id,
+        downstream.get("id"),
+    )
+    return 1
+
+
+def _dependency_event_error(job: dict) -> Optional[str]:
+    """Return why a dependent job's persisted completion event is unsafe."""
+    dependency = job.get("depends_on")
+    if not isinstance(dependency, dict):
+        return None
+    event = job.get("dependency_event")
+    if not isinstance(event, dict):
+        return "dependency event is missing"
+    if event.get("schema") != _DEPENDENCY_EVENT_SCHEMA:
+        return "dependency event schema is invalid"
+    if event.get("state") != "ready":
+        return "dependency event is not ready"
+    upstream_id = str(dependency.get("upstream_job_id") or "")
+    if not upstream_id or event.get("upstream_job_id") != upstream_id:
+        return "dependency event upstream identity is invalid"
+    if event.get("downstream_job_id") != job.get("id"):
+        return "dependency event downstream identity is invalid"
+    if event.get("validator") != {
+        "name": _DEPENDENCY_VALIDATOR,
+        "status": "passed",
+    }:
+        return "dependency event validator status is not passed"
+
+    latest = latest_execution(upstream_id)
+    if (
+        not isinstance(latest, dict)
+        or latest.get("id") != event.get("upstream_run_id")
+        or latest.get("status") != "completed"
+    ):
+        return "dependency event does not reference the latest completed upstream run"
+
+    try:
+        timezone_name = str(dependency.get("timezone") or "").strip()
+        business_date = _dependency_business_date(latest, timezone_name)
+    except ValueError as exc:
+        return str(exc)
+    if event.get("business_date") != business_date:
+        return "dependency event business date is stale"
+
+    upstream_job = next(
+        (candidate for candidate in load_jobs() if candidate.get("id") == upstream_id),
+        None,
+    )
+    if not isinstance(upstream_job, dict):
+        return "dependency upstream job is missing"
+    try:
+        artifact = _read_dependency_artifact(
+            upstream_job, dependency, business_date
+        )
+    except (OSError, ValueError) as exc:
+        return str(exc)
+    if artifact["path"] != event.get("artifact_path"):
+        return "dependency artifact path does not match the event"
+    if artifact["sha256"] != event.get("artifact_sha256"):
+        return "dependency artifact SHA does not match the event"
+    return None
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4292,6 +4610,24 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+
+        dependency_error = _dependency_event_error(job)
+        if dependency_error is not None:
+            raise CronPrerequisiteFailed(
+                f"Cron dependency prerequisite failed: {dependency_error}"
+            )
+        if isinstance(job.get("depends_on"), dict):
+            event = job.get("dependency_event")
+            event_id = event.get("id") if isinstance(event, dict) else None
+            consumed_event = consume_dependency_event(
+                job["id"], str(event_id or ""), str(execution_id)
+            )
+            if consumed_event is None:
+                raise CronPrerequisiteFailed(
+                    "Cron dependency prerequisite failed: dependency event "
+                    "was already consumed or changed"
+                )
+            job["dependency_event"] = consumed_event
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4423,12 +4759,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
-        finish_execution(
+        terminal_execution = finish_execution(
             execution_id,
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        if (
+            success
+            and isinstance(terminal_execution, dict)
+            and terminal_execution.get("status") == "completed"
+        ):
+            try:
+                _queue_one_hop_dependents(job, terminal_execution)
+            except Exception as dependency_exc:
+                logger.error(
+                    "Job '%s': failed to queue dependent after durable success: %s",
+                    job["id"],
+                    dependency_exc,
+                )
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
