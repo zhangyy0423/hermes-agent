@@ -257,6 +257,65 @@ def test_run_one_job_queues_dependency_only_after_durable_success(monkeypatch):
     assert [event[0] for event in events] == ["running", "finish", "queue"]
 
 
+def test_run_one_job_does_not_queue_dependency_for_blocked_receipt(
+    monkeypatch, tmp_path
+):
+    events = []
+    blocked_receipt = (
+        '{"status":"BLOCKED","reason_code":"UPSTREAM_DEFERRED",'
+        '"decision_eligible":false}'
+    )
+    terminal = _execution()
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: NOW)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda execution_id: events.append(("running", execution_id)),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None: (
+            True,
+            "output",
+            blocked_receipt,
+            None,
+        ),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: events.append(
+            ("finish", execution_id, kwargs)
+        )
+        or terminal,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_queue_one_hop_dependents",
+        lambda job, execution: events.append(
+            ("queue", job["id"], execution["id"])
+        )
+        or 1,
+        raising=False,
+    )
+    job = {
+        "id": UPSTREAM_ID,
+        "execution_id": RUN_ID,
+        "workdir": str(tmp_path),
+        "artifact_path": "reports/{YYYY-MM-DD}.md",
+        "artifact_min_chars": 500,
+    }
+
+    assert scheduler.run_one_job(job) is True
+    assert [event[0] for event in events] == ["running", "finish"]
+    assert (tmp_path / "reports" / "2026-08-14.md").read_text() == blocked_receipt
+
+
 def test_run_one_job_rejects_missing_dependency_event_before_agent(
     monkeypatch, tmp_path
 ):

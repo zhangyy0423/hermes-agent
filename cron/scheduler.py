@@ -4769,6 +4769,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success
             and isinstance(terminal_execution, dict)
             and terminal_execution.get("status") == "completed"
+            and not _is_strict_blocked_receipt(final_response)
         ):
             try:
                 _queue_one_hop_dependents(job, terminal_execution)
