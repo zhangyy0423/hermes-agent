@@ -227,6 +227,36 @@ def _skill_blocked_result(job: dict, skill_load: dict, error: str) -> tuple[bool
     )
 
 
+def _is_strict_blocked_receipt(response: str) -> bool:
+    """Return whether response is exactly the fail-closed BLOCKED receipt."""
+    if not isinstance(response, str):
+        return False
+
+    def _reject_duplicate_keys(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("duplicate JSON key")
+            parsed[key] = value
+        return parsed
+
+    try:
+        receipt = json.loads(response, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+
+    required_keys = {"status", "reason_code", "decision_eligible"}
+    reason_code = receipt.get("reason_code") if isinstance(receipt, dict) else None
+    return (
+        isinstance(receipt, dict)
+        and set(receipt) == required_keys
+        and receipt.get("status") == "BLOCKED"
+        and isinstance(reason_code, str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]*", reason_code) is not None
+        and receipt.get("decision_eligible") is False
+    )
+
+
 def _write_job_artifact(job: dict, final_response: str) -> Path:
     """Atomically persist a cron job's final response inside its workdir.
 
@@ -268,10 +298,11 @@ def _write_job_artifact(job: dict, final_response: str) -> Path:
         raise ValueError("artifact_min_chars must be a positive integer") from exc
     if minimum_chars < 1:
         raise ValueError("artifact_min_chars must be a positive integer")
-    if len(final_response.strip()) < minimum_chars:
+    response_chars = len(final_response.strip())
+    if response_chars < minimum_chars and not _is_strict_blocked_receipt(final_response):
         raise ValueError(
             "final response is shorter than artifact_min_chars "
-            f"({len(final_response.strip())} < {minimum_chars})"
+            f"({response_chars} < {minimum_chars})"
         )
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -4451,6 +4482,25 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
+def _report_scheduler_persistence_failure(stage: str, exc: Exception) -> None:
+    """Best-effort stage receipt without job content or exception text."""
+    errno_value = getattr(exc, "errno", None)
+    if not isinstance(errno_value, int):
+        errno_value = "none"
+    message = (
+        "CRON_SCHEDULER_PERSISTENCE_FAILED "
+        f"stage={stage} exception={type(exc).__name__} errno={errno_value}"
+    )
+    try:
+        logger.error("%s", message)
+    except Exception:
+        pass
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -4497,7 +4547,11 @@ def tick(
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
 
-        due_jobs = get_due_jobs()
+        try:
+            due_jobs = get_due_jobs()
+        except Exception as exc:
+            _report_scheduler_persistence_failure("due_scan", exc)
+            raise
 
         if not due_jobs:
             # Idle tick: skip config load + pool partitioning entirely
@@ -4524,7 +4578,11 @@ def tick(
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
         # Batched: one load + one save for the whole due set, not one per job.
-        advance_next_runs([job["id"] for job in due_jobs])
+        try:
+            advance_next_runs([job["id"] for job in due_jobs])
+        except Exception as exc:
+            _report_scheduler_persistence_failure("next_run_advance", exc)
+            raise
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
