@@ -3765,6 +3765,46 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _parse_precheck_hard_block(script_output: str) -> Optional[str]:
+    """Return a machine-authored strict BLOCKED receipt from precheck stdout.
+
+    Same convention as ``_parse_wake_gate`` (last non-empty stdout line,
+    JSON), but detects Polaris's short-term precheck hard-block contract
+    (``shared/scripts/short_term_preflight_contract.py`` — see
+    ``POLARIS_SHORT_TERM_BLOCKED_RECEIPT_V1`` in the job prompts): when the
+    engine subprocess or an upstream gate fails, ``pre_check.py`` prints
+    exactly one strict ``{"status":"BLOCKED","reason_code":...,
+    "decision_eligible":false}`` line as its last output and returns exit
+    code 0 (a precheck failure is not a script crash).
+
+    The prompt asked the model to echo that line byte-for-byte so it lands
+    in ``final_response`` and passes ``_write_job_artifact``'s
+    ``artifact_min_chars`` exemption for strict receipts. That transcription
+    is not guaranteed: model output is not a deterministic function, and an
+    off-contract free-text reply (short prose, long prose, anything that is
+    not the exact receipt) either fails the length gate or silently reaches
+    an owner as an ungated paragraph. Both failure modes were observed
+    together on 2026-09-04 07:30/09:25 (457- and 777-character free text,
+    neither long enough for the artifact minimum nor a valid receipt).
+
+    Returning the receipt straight from the deterministic precheck output —
+    before any LLM call is made — removes the model from this critical
+    path entirely for the failure case. The success case (script emits
+    real market/signal data, no hard-block line) is untouched: this
+    returns ``None`` and ``run_job`` proceeds to the ordinary LLM call
+    exactly as before.
+    """
+    if not script_output:
+        return None
+    stripped_lines = [line for line in script_output.splitlines() if line.strip()]
+    if not stripped_lines:
+        return None
+    last_line = stripped_lines[-1].strip()
+    if _is_strict_blocked_receipt(last_line):
+        return last_line
+    return None
+
+
 def _build_job_prompt(
     job: dict,
     prerun_script: Optional[tuple] = None,
@@ -4894,6 +4934,35 @@ def run_job(
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
             return True, silent_doc, SILENT_MARKER, None
+
+        # Precheck hard-block: the script itself (not the LLM) already
+        # rendered a strict BLOCKED receipt as its last stdout line — e.g.
+        # Polaris's short-term engine subprocess exit code != 0
+        # (SHORT_TERM_ENGINE_FAILED). Historically the prompt asked the
+        # model to transcribe that line verbatim into final_response, which
+        # is where _write_job_artifact's artifact_min_chars exemption for
+        # strict receipts is actually enforced. Model transcription is not
+        # deterministic (2026-09-04: two rounds emitted 457/777 chars of
+        # free text instead of the receipt, both failing the length gate
+        # unnoticed). Returning the receipt here, before the agent is ever
+        # constructed, makes this failure path deterministic and removes
+        # the model from it. Any run without a hard-block line falls
+        # through unchanged to the ordinary LLM call below.
+        _hard_block = _parse_precheck_hard_block(_script_output)
+        if _ran_ok and _hard_block is not None:
+            logger.info(
+                "Job '%s' (ID: %s): precheck hard-block %s — machine "
+                "receipt returned without an agent run",
+                job_name, job_id, _hard_block,
+            )
+            blocked_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Precheck script hard-blocked this run with a strict "
+                f"BLOCKED receipt:\n\n```\n{_hard_block}\n```\n"
+            )
+            return True, blocked_doc, _hard_block, None
 
     try:
         prompt = _build_job_prompt(
