@@ -14,6 +14,8 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
+import importlib
 import json
 import logging
 import os
@@ -22,10 +24,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -62,6 +66,221 @@ from agent.delegation_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Repo roots for locating repo-side helpers, resolved once per process.
+# ``None`` = not computed yet.
+_REPO_SEARCH_ROOTS: Optional[tuple] = None
+# Resolved BLOCKED-receipt renderer: empty = unresolved, [callable] = loaded.
+# Only successful resolutions are cached, so fixing the cause does not need a
+# restart; the "unavailable" warning is deduplicated separately.
+_BLOCKED_RENDERER: list = []
+_BLOCKED_RENDERER_WARNED = False
+
+
+def _repo_search_roots() -> tuple:
+    """Absolute roots to search for repo-side helpers.
+
+    Deliberately independent of BOTH the running job's ``workdir`` and the
+    process cwd, which is what T35 left unfixed: 43 of 141 jobs declare
+    ``workdir: null``, and the gateway runs with cwd ``~/.hermes`` and neither
+    ``HERMES_CRON_WORKDIR`` nor ``POLARIS_ROOT`` in its environment.  For those
+    jobs the old workdir/cwd-derived search walked ``~/.hermes`` → ``~`` → ``/``,
+    found nothing, and every BLOCKED receipt degraded to the "renderer
+    unavailable" fallback text (observed ~1 per 20 min from job
+    ``e2bba9f0b17a``).
+
+    Sources, most explicit first:
+
+    1. ``cron.polaris_root`` / ``cron.polaris_roots`` in ``config.yaml`` —
+       operator-controlled and survives Hermes upgrades.  Optional: absent
+       keys simply contribute nothing.
+    2. ``HERMES_CRON_WORKDIR`` / ``POLARIS_ROOT`` from the environment.
+    3. Absolute ``workdir`` values declared by other jobs in ``jobs.json``,
+       most frequently used first.  This makes resolution self-healing: as
+       long as *some* job names the repo root, workdir-less jobs inherit it
+       without any new configuration.
+
+    Relative and unparsable entries are dropped; order is preserved and
+    deduplicated.  Cached for the process lifetime — all three sources are
+    effectively static, and this runs on the BLOCKED-receipt path.
+    """
+    global _REPO_SEARCH_ROOTS
+    if _REPO_SEARCH_ROOTS is not None:
+        return _REPO_SEARCH_ROOTS
+
+    roots: list = []
+
+    def _add(raw) -> None:
+        text = str(raw or "").strip()
+        if not text:
+            return
+        try:
+            candidate = Path(text).expanduser()
+        except (OSError, RuntimeError, ValueError):
+            return
+        if not candidate.is_absolute():
+            return
+        if candidate not in roots:
+            roots.append(candidate)
+
+    try:
+        cron_cfg = (load_config() or {}).get("cron")
+        if isinstance(cron_cfg, dict):
+            _add(cron_cfg.get("polaris_root"))
+            raw_multi = cron_cfg.get("polaris_roots")
+            if isinstance(raw_multi, (list, tuple)):
+                for item in raw_multi:
+                    _add(item)
+    except Exception:
+        logger.debug("repo root discovery: config unreadable", exc_info=True)
+
+    for env_name in ("HERMES_CRON_WORKDIR", "POLARIS_ROOT"):
+        _add(os.environ.get(env_name))
+
+    try:
+        from cron.jobs import _current_cron_store
+
+        jobs_file = Path(_current_cron_store().jobs_file)
+        raw_store = json.loads(jobs_file.read_text(encoding="utf-8"))
+        records = raw_store.get("jobs") if isinstance(raw_store, dict) else raw_store
+        counts: dict = {}
+        for record in records or []:
+            if not isinstance(record, dict):
+                continue
+            text = str(record.get("workdir") or "").strip()
+            if text:
+                counts[text] = counts.get(text, 0) + 1
+        for text, _count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            _add(text)
+    except Exception:
+        logger.debug("repo root discovery: jobs store unreadable", exc_info=True)
+
+    _REPO_SEARCH_ROOTS = tuple(roots)
+    return _REPO_SEARCH_ROOTS
+
+
+def _load_blocked_receipt_renderer(roots) -> Optional[Any]:
+    """Return the repo-side BLOCKED receipt renderer, or ``None``.
+
+    Successful resolutions are cached for the process; a miss is retried on the
+    next call (so an operator fixing ``cron.polaris_root`` does not have to
+    restart the gateway) but only warns once.
+    """
+    global _BLOCKED_RENDERER_WARNED
+    if _BLOCKED_RENDERER:
+        return _BLOCKED_RENDERER[0]
+    try:
+        from shared.lib.blocked_receipt_delivery import (
+            render_blocked_receipt_for_delivery,
+        )
+    except ImportError:
+        render_blocked_receipt_for_delivery = None
+        renderer_path = None
+        for root in roots:
+            try:
+                resolved = Path(root).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            for parent in (resolved, *resolved.parents):
+                candidate = parent / "shared/lib/blocked_receipt_delivery.py"
+                if candidate.is_file():
+                    renderer_path = candidate
+                    break
+            if renderer_path is not None:
+                break
+        if renderer_path is None:
+            if not _BLOCKED_RENDERER_WARNED:
+                _BLOCKED_RENDERER_WARNED = True
+                logger.warning(
+                    "BLOCKED receipt renderer unavailable; using built-in "
+                    "fallback. Searched roots: %s. Set cron.polaris_root in "
+                    "config.yaml to the repo root to fix this permanently.",
+                    ", ".join(str(r) for r in roots) or "(none)",
+                )
+            return None
+        spec = importlib.util.spec_from_file_location(
+            "polaris_blocked_receipt_delivery", renderer_path
+        )
+        if spec is None or spec.loader is None:
+            logger.warning(
+                "BLOCKED receipt renderer could not be loaded from %s; "
+                "using built-in fallback", renderer_path,
+            )
+            return None
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            logger.warning(
+                "BLOCKED receipt renderer at %s failed to import (%s); "
+                "using built-in fallback", renderer_path, exc,
+            )
+            return None
+        render_blocked_receipt_for_delivery = getattr(
+            module, "render_blocked_receipt_for_delivery", None
+        )
+        if render_blocked_receipt_for_delivery is None:
+            logger.warning(
+                "BLOCKED receipt renderer at %s exposes no "
+                "render_blocked_receipt_for_delivery; using built-in fallback",
+                renderer_path,
+            )
+            return None
+    _BLOCKED_RENDERER.append(render_blocked_receipt_for_delivery)
+    return render_blocked_receipt_for_delivery
+
+
+def _render_blocked_receipt_for_delivery(response: str, job: dict) -> str:
+    """Render a strict BLOCKED receipt for chat without changing its artifact."""
+
+    def fallback() -> str:
+        if not _is_strict_blocked_receipt(response):
+            return response
+        try:
+            reason_code = json.loads(response)["reason_code"]
+        except (TypeError, KeyError, json.JSONDecodeError):
+            reason_code = "UNKNOWN"
+        return (
+            f"任务“{job.get('name') or job.get('id') or 'cron job'}”未生成报告。\n"
+            f"原因码：{reason_code}\n"
+            "原因：BLOCKED 收据渲染器不可用，暂无法读取原因码说明。\n"
+            "处理：请负责人检查 Hermes 运行态 renderer 加载路径后再重跑。"
+        )
+
+    roots = []
+    raw_workdir = str(job.get("workdir") or "").strip()
+    if raw_workdir:
+        try:
+            candidate = Path(raw_workdir).expanduser()
+        except (OSError, RuntimeError, ValueError):
+            candidate = None
+        if candidate is not None:
+            roots.append(candidate)
+    # Process-wide roots (config → env → sibling jobs' workdirs). The job's own
+    # workdir stays first so a job that declares one keeps its old behaviour;
+    # everything after it is what makes workdir-less jobs work at all.
+    for extra_root in _repo_search_roots():
+        if extra_root not in roots:
+            roots.append(extra_root)
+    # Path.cwd() last, and only as a legacy safety net — the gateway's cwd is
+    # ~/.hermes, which is exactly why this used to resolve to nothing.
+    try:
+        cwd_root = Path.cwd()
+    except (OSError, RuntimeError, ValueError):
+        cwd_root = None
+    if cwd_root is not None and cwd_root not in roots:
+        roots.append(cwd_root)
+
+    render_blocked_receipt_for_delivery = _load_blocked_receipt_renderer(roots)
+    if render_blocked_receipt_for_delivery is None:
+        return fallback()
+    job_name = str(job.get("name") or job.get("id") or "cron job")
+    return render_blocked_receipt_for_delivery(
+        response,
+        job_name=job_name,
+        search_roots=tuple(roots),
+    )
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -355,6 +574,515 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+class CronPrerequisiteFailed(Exception):
+    """A declared cron prerequisite was not satisfied."""
+
+
+# These two jobs deliberately use a scheduler-owned success receipt.  Their
+# model output remains the staging report; the receipt binds the current
+# snapshot and staging SHA before a downstream finalizer can consume it.
+_MONTHLY_PRODUCER_REPORT_TYPES = {
+    "e70092d09395": "watchlist-monthly",
+    "b9bf16c7d550": "macro-monthly",
+}
+
+
+def _is_strict_blocked_receipt(response: str) -> bool:
+    """Return whether *response* is exactly the fail-closed BLOCKED receipt."""
+    if not isinstance(response, str):
+        return False
+
+    def _reject_duplicate_keys(pairs):
+        parsed = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("duplicate JSON key")
+            parsed[key] = value
+        return parsed
+
+    try:
+        receipt = json.loads(response, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+
+    required_keys = {"status", "reason_code", "decision_eligible"}
+    reason_code = receipt.get("reason_code") if isinstance(receipt, dict) else None
+    return (
+        isinstance(receipt, dict)
+        and set(receipt) == required_keys
+        and receipt.get("status") == "BLOCKED"
+        and isinstance(reason_code, str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]*", reason_code) is not None
+        and receipt.get("decision_eligible") is False
+    )
+
+
+def _record_skill_load(job: dict, skill_load: dict) -> None:
+    """Attach and best-effort persist the skill contract receipt."""
+    job["_skill_load"] = skill_load
+    job["last_skill_load"] = skill_load
+    try:
+        set_job_skill_load(str(job.get("id") or ""), skill_load)
+    except Exception:
+        logger.debug(
+            "Job '%s': failed to persist skill receipt",
+            job.get("id"),
+            exc_info=True,
+        )
+
+
+def _write_job_artifact(job: dict, final_response: str) -> Path:
+    """Atomically write a configured business artifact inside ``workdir``."""
+    raw_path = str(job.get("artifact_path") or "").strip()
+    if not raw_path:
+        raise ValueError("artifact_path is required")
+    raw_workdir = str(job.get("workdir") or "").strip()
+    if not raw_workdir:
+        raise ValueError("workdir is required when artifact_path is configured")
+    workdir = Path(raw_workdir).expanduser().resolve()
+    if not workdir.is_dir():
+        raise ValueError(f"workdir is not an existing directory: {workdir}")
+    rendered = raw_path.replace("{YYYY-MM-DD}", _hermes_now().strftime("%Y-%m-%d"))
+    relative = Path(rendered).expanduser()
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("artifact_path must be relative to workdir without '..'")
+    target = (workdir / relative).resolve()
+    try:
+        target.relative_to(workdir)
+    except ValueError as exc:
+        raise ValueError("artifact_path resolves outside workdir") from exc
+    try:
+        minimum_chars = int(job.get("artifact_min_chars", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("artifact_min_chars must be a positive integer") from exc
+    if minimum_chars < 1:
+        raise ValueError("artifact_min_chars must be a positive integer")
+    response_chars = len(str(final_response).strip())
+    if response_chars < minimum_chars and not _is_strict_blocked_receipt(final_response):
+        raise ValueError(
+            "final response is shorter than artifact_min_chars "
+            f"({response_chars} < {minimum_chars})"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    parent = target.parent.resolve()
+    try:
+        parent.relative_to(workdir)
+    except ValueError as exc:
+        raise ValueError("artifact_path parent resolves outside workdir") from exc
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(parent))
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(str(final_response))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        try:
+            directory_fd = os.open(parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return target
+
+
+# ── Product acceptance: freshness + run binding ────────────────────────────
+#
+# T40 proved a whole class of false green lights: job ``e65e6b73e2b6``
+# (风控守卫-日度巡检, 15:40 cron) reported ``completed`` every day from
+# 2026-08-24 to 08-31 while its product,
+# ``shared/data/投资/reports/风控巡检/<date>.md``, stayed a constant 780-byte
+# ``assessment_unavailable`` receipt written around 11:00 by the early-report
+# preparation chain (``ensure_current_unavailable_risk_report()``), hours
+# BEFORE the run that claimed credit for it.  The receipt's
+# ``producer: "cron-job:e65e6b73e2b6"`` is a static contract identity, not
+# evidence that this job produced anything.  Nothing in the scheduler compared
+# the product against the run, so "completed" only ever meant "the agent
+# stopped without raising".
+#
+# The judgement below is deliberately about the *run*, not about the producer
+# string: a file whose mtime (and, when the format exposes one, whose
+# ``as_of``) predates this run's start was not produced by this run, whoever
+# it claims to be from.
+_PRODUCT_STALE_MARKER = "PRODUCT_NOT_FROM_THIS_RUN"
+# P5 (2026-09-01): the run-binding check above is anchored on a declared
+# product path. A job that declares NONE has no acceptance criterion at all —
+# "completed" then only means "the turn ended without raising". Live sample:
+# 8be6d4c9f2a3 主线股双周深度分析 ran 10:30:54→10:45:23, status=completed,
+# finish_reason=stop, 40 API calls, 2993-char final response, and wrote
+# ZERO products (both targets its prompt names were untouched; the newest
+# investment-engine/output/reports/双周主线分析_*.md was still 20260801 and
+# shared/data/投资/reports/主线双周深度/latest.md still had 8/1 14:54 mtime).
+#
+# 141 jobs split: 8 have prompt+artifact_path, 79 have prompt and NO
+# artifact_path (27 of those are no_agent, 46 are enabled non-no_agent), 2 have
+# artifact_path without prompt, 52 have neither. Flipping straight to "fail"
+# would turn 46 jobs red in a single tick — 37 of them the same primary model —
+# which destroys the signal instead of creating it. Hence a three-state knob,
+# ``cron.product_contract_mode`` in config.yaml:
+#
+#   observe (default) — record the gap, leave last_status alone. Builds the
+#                       "who has no product contract" ledger in errors.log so
+#                       declarations can be backfilled from real runs.
+#   enforce           — fail the run with PRODUCT_CONTRACT_MISSING.
+#   off               — skip the check entirely.
+_PRODUCT_CONTRACT_MISSING = "PRODUCT_CONTRACT_MISSING"
+_PRODUCT_CONTRACT_MODES = ("observe", "enforce", "off")
+_PRODUCT_CONTRACT_DEFAULT_MODE = "observe"
+
+
+def _product_contract_mode() -> str:
+    """Resolve ``cron.product_contract_mode``; unset/invalid → ``observe``."""
+    try:
+        cron_cfg = (load_config() or {}).get("cron")
+        if isinstance(cron_cfg, dict):
+            mode = str(cron_cfg.get("product_contract_mode") or "").strip().lower()
+            if mode in _PRODUCT_CONTRACT_MODES:
+                return mode
+    except Exception:
+        logger.debug("product contract mode unreadable", exc_info=True)
+    return _PRODUCT_CONTRACT_DEFAULT_MODE
+
+
+def _product_contract_gap(job: dict) -> Optional[str]:
+    """Return a reason when an agent job declares no product at all.
+
+    Only agent jobs are in scope: a ``no_agent`` script job's stdout IS its
+    output and the exit code is its acceptance, so it needs no product path.
+    A job with no prompt has nothing to produce either.
+    """
+    if job.get("no_agent"):
+        return None
+    if not str(job.get("prompt") or "").strip():
+        return None
+    if str(job.get("artifact_path") or "").strip():
+        return None
+    raw_verify = job.get("verify_artifact_path")
+    if isinstance(raw_verify, (list, tuple)):
+        if any(str(item).strip() for item in raw_verify):
+            return None
+    elif str(raw_verify or "").strip():
+        return None
+    return (
+        f"{_PRODUCT_CONTRACT_MISSING}: job has a prompt but declares neither "
+        "artifact_path nor verify_artifact_path, so no run-binding check can "
+        "apply and 'completed' only means the turn ended without raising"
+    )
+
+# Filesystem timestamp granularity + the gap between "run start" and the first
+# write. Small on purpose: the failure mode being caught is hours off, not
+# seconds.
+_PRODUCT_FRESHNESS_SLACK_SECONDS = 2.0
+_AS_OF_PATTERN = re.compile(
+    r"""["']?as_of["']?\s*[:=]\s*["']?"""
+    r"""(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"""
+    r"""(?:Z|[+-]\d{2}:?\d{2})?)""",
+    re.IGNORECASE,
+)
+
+
+def _render_artifact_template(raw: str) -> str:
+    """Expand the date placeholders used in artifact paths.
+
+    ``{YYYY-MM-DD}`` mirrors ``_write_job_artifact``; the split forms are
+    accepted so a verification path can address a nested date layout.
+    """
+    now = _hermes_now()
+    return (
+        raw.replace("{YYYY-MM-DD}", now.strftime("%Y-%m-%d"))
+        .replace("{YYYY}", now.strftime("%Y"))
+        .replace("{MM}", now.strftime("%m"))
+        .replace("{DD}", now.strftime("%d"))
+    )
+
+
+def _parse_product_as_of(text: str, reference: datetime) -> Optional[datetime]:
+    """Return the ``as_of`` timestamp a product declares, or ``None``.
+
+    Covers the JSON (``"as_of": "..."``) and front-matter / YAML
+    (``as_of: ...``) spellings.  Naive timestamps inherit *reference*'s
+    timezone — business products are written in business-local time, and the
+    system clock here is UTC, so assuming UTC would shift them by 8 hours.
+    """
+    match = _AS_OF_PATTERN.search(text[:20000])
+    if match is None:
+        return None
+    raw = match.group(1).strip().replace(" ", "T")
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=reference.tzinfo)
+    return parsed
+
+
+def _resolve_product_path(job: dict, raw_path: str) -> Optional[Path]:
+    """Resolve a declared product path without depending on the process cwd."""
+    rendered = _render_artifact_template(raw_path)
+    try:
+        candidate = Path(rendered).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate.is_absolute():
+        return candidate
+    bases: list = []
+    raw_workdir = str(job.get("workdir") or "").strip()
+    if raw_workdir:
+        try:
+            bases.append(Path(raw_workdir).expanduser())
+        except (OSError, RuntimeError, ValueError):
+            pass
+    for root in _repo_search_roots():
+        if root not in bases:
+            bases.append(root)
+    for base in bases:
+        target = base / candidate
+        if target.exists():
+            return target
+    # Nothing on disk: still return the primary candidate so the caller can
+    # report a concrete missing path instead of an unresolved template.
+    return (bases[0] / candidate) if bases else None
+
+
+def _check_product_candidate(
+    job: dict,
+    raw_declared: str,
+    source: str,
+    minimum_raw: Any,
+    run_started_at: datetime,
+) -> Optional[str]:
+    """Freshness + run-binding check for ONE declared product path."""
+    try:
+        target = _resolve_product_path(job, raw_declared)
+        if target is None:
+            return (
+                f"{_PRODUCT_STALE_MARKER}: cannot resolve {source}="
+                f"{raw_declared!r} — the job declares no workdir and no repo "
+                "root is known (set cron.polaris_root in config.yaml)"
+            )
+        if not target.exists():
+            return (
+                f"{_PRODUCT_STALE_MARKER}: declared product is missing: "
+                f"{target}"
+            )
+        stat_result = target.stat()
+        started_ts = run_started_at.timestamp()
+        floor_ts = started_ts - _PRODUCT_FRESHNESS_SLACK_SECONDS
+        if stat_result.st_mtime < floor_ts:
+            mtime_iso = datetime.fromtimestamp(
+                stat_result.st_mtime, tz=run_started_at.tzinfo
+            ).isoformat()
+            return (
+                f"{_PRODUCT_STALE_MARKER}: {target} mtime={mtime_iso} predates "
+                f"this run (started {run_started_at.isoformat()}) — the file "
+                "was produced by something other than this run"
+            )
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            minimum_chars = int(minimum_raw)
+        except (TypeError, ValueError):
+            minimum_chars = 1
+        # A strict BLOCKED receipt is a legitimate, deliberately short terminal
+        # state — ``_write_job_artifact`` exempts it from ``artifact_min_chars``
+        # for exactly that reason (the 短线午盘 ``331 < 500`` false kill). Do not
+        # re-impose the length gate here, or this acceptance check would undo
+        # that fix and turn correct fail-closed receipts into failures.
+        if (
+            minimum_chars > 0
+            and len(text.strip()) < minimum_chars
+            and not _is_strict_blocked_receipt(text.strip())
+        ):
+            return (
+                f"{_PRODUCT_STALE_MARKER}: {target} is shorter than the "
+                f"declared minimum ({len(text.strip())} < {minimum_chars})"
+            )
+        as_of = _parse_product_as_of(text, run_started_at)
+        # P-20260921 (owner 裁决 P1): 派生报告 job 可以显式声明
+        # ``verify_artifact_allow_upstream_as_of: true``，跳过 as_of 独立判死。
+        # 语义：这类 job 的正文引用上游报告的 as_of（如市场分析引用市场脉搏
+        # 16:49），as_of 早于本 run 属于派生产物的正常形态，不是 re-touch。
+        # mtime 判死保留 —— 重摸旧文件的 T40 场景由 mtime 分支兜底捕获
+        # （re-touch 更新 mtime 但内容陈旧的另一形态已由 min_chars 与
+        # package validator 覆盖）。默认 false，不改任何既有 job 行为。
+        allow_upstream_as_of = bool(
+            job.get("verify_artifact_allow_upstream_as_of")
+        )
+        if (
+            as_of is not None
+            and as_of.timestamp() < floor_ts
+            and not allow_upstream_as_of
+        ):
+            return (
+                f"{_PRODUCT_STALE_MARKER}: {target} declares "
+                f"as_of={as_of.isoformat()}, which predates this run (started "
+                f"{run_started_at.isoformat()}) — a re-touched stale product "
+                "does not count as this run's output"
+            )
+        if allow_upstream_as_of and as_of is not None and as_of.timestamp() < floor_ts:
+            logger.info(
+                "Job '%s': product as_of=%s predates run start but "
+                "upstream-as-of semantics allow it (derived product)",
+                job.get("id"), as_of.isoformat(),
+            )
+        logger.info(
+            "Job '%s': product accepted via %s: %s (mtime %s, as_of %s)",
+            job.get("id"), source, target,
+            datetime.fromtimestamp(
+                stat_result.st_mtime, tz=run_started_at.tzinfo
+            ).isoformat(),
+            as_of.isoformat() if as_of is not None else "n/a",
+        )
+        return None
+    except Exception as exc:  # never let acceptance crash the terminal write
+        return (
+            f"{_PRODUCT_STALE_MARKER}: product verification failed for "
+            f"{source}={raw_declared!r}: {type(exc).__name__}: {exc}"
+        )
+
+
+def _verify_job_product_binding(
+    job: dict, run_started_at: Optional[datetime]
+) -> Optional[str]:
+    """Return a failure reason when the declared product is not from this run.
+
+    Declared by either:
+
+    * ``verify_artifact_path`` — opt-in for jobs whose product is written by
+      the prompt/skill via tools rather than by the scheduler.  This is the
+      field that closes the 风控巡检 hole.  A list is accepted and means "any
+      one of these, fresh, is a valid product of this run" — needed because a
+      daily job can legitimately land either a report or a closed-day receipt
+      depending on the calendar.
+    * ``artifact_path`` — the scheduler wrote it itself moments ago, so a
+      violation here means the write silently did not land (the "job reports
+      completed but the product does not exist" half of the same class).
+
+    Returns ``None`` when nothing is declared, when no run start is known, or
+    when the product passes.  Never raises.
+    """
+    if run_started_at is None:
+        return None
+    declared: list = []
+    source = "verify_artifact_path"
+    minimum_raw = job.get("verify_artifact_min_chars", 1)
+    raw_verify = job.get("verify_artifact_path")
+    if isinstance(raw_verify, (list, tuple)):
+        declared = [str(item).strip() for item in raw_verify if str(item).strip()]
+    elif str(raw_verify or "").strip():
+        declared = [str(raw_verify).strip()]
+    if not declared:
+        source = "artifact_path"
+        minimum_raw = job.get("artifact_min_chars", 1)
+        if str(job.get("artifact_path") or "").strip():
+            declared = [str(job.get("artifact_path")).strip()]
+    if not declared:
+        return None
+    reasons: list = []
+    for raw_declared in declared:
+        reason = _check_product_candidate(
+            job, raw_declared, source, minimum_raw, run_started_at
+        )
+        if reason is None:
+            return None
+        reasons.append(reason)
+    if len(reasons) == 1:
+        return reasons[0]
+    return (
+        f"{_PRODUCT_STALE_MARKER}: none of the {len(reasons)} declared products "
+        "is a product of this run — "
+        + " | ".join(r.split(": ", 1)[-1] for r in reasons)
+    )
+
+
+def _monthly_producer_artifact_response(job: dict) -> str:
+    """Build the structured artifact for an allowlisted monthly producer.
+
+    Monthly producer jobs run with ``file,no_mcp`` and only own the staging
+    body.  The repository finalizer validates the current snapshot and emits
+    the deterministic ``polaris.monthly-producer-success.v1`` receipt.
+    """
+    job_id = str(job.get("id") or "")
+    report_type = _MONTHLY_PRODUCER_REPORT_TYPES.get(job_id)
+    if report_type is None:
+        raise ValueError("monthly producer job is not allowlisted")
+
+    workdir_text = str(job.get("workdir") or "").strip()
+    if not workdir_text:
+        raise ValueError("monthly producer workdir is required")
+    repo_root = Path(workdir_text).expanduser().resolve()
+    script_path = repo_root / "shared" / "scripts" / "monthly_report_finalize.py"
+    if not script_path.is_file() or script_path.is_symlink():
+        raise ValueError("monthly receipt builder is unavailable")
+
+    state_root = (_get_hermes_home() / "state").resolve()
+    snapshot_path = state_root / "research-report-inputs" / report_type / "current.json"
+    if snapshot_path.is_symlink() or not snapshot_path.is_file():
+        raise ValueError("monthly current snapshot is unavailable")
+    try:
+        before = snapshot_path.stat()
+        raw_snapshot = snapshot_path.read_text(encoding="utf-8")
+        after = snapshot_path.stat()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("monthly current snapshot is unreadable") from exc
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise ValueError("monthly current snapshot changed during read")
+    try:
+        snapshot = json.loads(raw_snapshot)
+    except json.JSONDecodeError as exc:
+        raise ValueError("monthly current snapshot is invalid JSON") from exc
+    if not isinstance(snapshot, dict) or snapshot.get("report_type") != report_type:
+        raise ValueError("monthly current snapshot type mismatch")
+    business_date = str(snapshot.get("issue_date") or "")
+    snapshot_sha = str(snapshot.get("snapshot_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", snapshot_sha):
+        raise ValueError("monthly current snapshot SHA is invalid")
+    if business_date != _hermes_now().strftime("%Y-%m-%d"):
+        raise ValueError("monthly current snapshot date does not match scheduler date")
+
+    previous_sys_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(repo_root))
+        module = importlib.import_module("shared.scripts.monthly_report_finalize")
+        module_file = Path(str(getattr(module, "__file__", ""))).resolve()
+        if module_file != script_path.resolve():
+            raise ValueError("monthly receipt builder resolved outside job workdir")
+        builder = getattr(module, "_emit_success_receipt", None)
+        if not callable(builder):
+            raise ValueError("monthly receipt builder entrypoint is unavailable")
+        receipt = builder(
+            producer_job_id=job_id,
+            business_date=business_date,
+            snapshot_ref=f"{snapshot_path.resolve()}#{snapshot_sha}",
+            state_root=state_root,
+        )
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("monthly "):
+            raise
+        raise ValueError(f"monthly success receipt build failed: {exc}") from exc
+    finally:
+        sys.path[:] = previous_sys_path
+
+    if not isinstance(receipt, dict) or receipt.get("status") != "SUCCESS":
+        raise ValueError("monthly success receipt is invalid")
+    return json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -501,11 +1229,21 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
+    consume_dependency_event,
+    load_jobs,
     mark_job_run,
+    normalize_skill_requirements,
     save_job_output,
+    set_job_skill_load,
+    update_job,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    latest_completed_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3482,6 +4220,7 @@ def _windows_cron_bootstrap_argv(
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
     cancel_event: Optional[_CancelEventLike] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
@@ -3515,6 +4254,9 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        extra_env: Validated scheduler-owned values to add to the sanitized
+            child environment.  This is used for dependency event bindings,
+            never for provider credentials or arbitrary job configuration.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -3618,6 +4360,16 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
+        if workdir:
+            configured_workdir = Path(workdir).expanduser().resolve()
+            _script_cwd = str(configured_workdir)
+            # An explicit extra_env value remains authoritative for callers
+            # that bind a different root for this child process; otherwise
+            # replace any inherited value with this job's resolved workdir.
+            if not extra_env or "HERMES_CRON_WORKDIR" not in extra_env:
+                env["HERMES_CRON_WORKDIR"] = str(configured_workdir)
+        if extra_env:
+            env.update({str(key): str(value) for key, value in extra_env.items()})
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -3675,6 +4427,7 @@ def _run_job_script_with_claim_heartbeat(
     job: dict,
     script_path: str,
     workdir: Optional[str] = None,
+    extra_env: Optional[dict[str, str]] = None,
     cancel_event: Optional[_CancelEventLike] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
@@ -3689,6 +4442,7 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    effective_workdir = workdir if workdir is not None else job.get("workdir")
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -3697,7 +4451,12 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=effective_workdir,
+            extra_env=extra_env,
+            cancel_event=cancel_event,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -3728,15 +4487,60 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=effective_workdir,
+            extra_env=extra_env,
+            cancel_event=cancel_event,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=effective_workdir,
+            extra_env=extra_env,
+            cancel_event=cancel_event,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
         # heartbeat is already waiting on another process's jobs-file lock.
         heartbeat_thread.join(timeout=1.0)
+
+
+def _dependency_event_script_env(job: dict) -> dict[str, str]:
+    """Expose one consumed dependency event to its exact no-agent script."""
+    if not isinstance(job.get("depends_on"), dict):
+        return {}
+    event = job.get("dependency_event")
+    if not isinstance(event, dict) or event.get("state") != "consumed":
+        raise CronPrerequisiteFailed("dependency event is not consumed")
+    required = {
+        "id": "HERMES_CRON_DEPENDENCY_EVENT_ID",
+        "upstream_job_id": "HERMES_CRON_DEPENDENCY_UPSTREAM_JOB_ID",
+        "upstream_run_id": "HERMES_CRON_DEPENDENCY_UPSTREAM_RUN_ID",
+        "business_date": "HERMES_CRON_DEPENDENCY_BUSINESS_DATE",
+        "artifact_path": "HERMES_CRON_DEPENDENCY_ARTIFACT_PATH",
+        "artifact_sha256": "HERMES_CRON_DEPENDENCY_ARTIFACT_SHA256",
+    }
+    values = {key: str(event.get(key) or "") for key in required}
+    if not re.fullmatch(r"[0-9a-f]{64}", values["id"]):
+        raise CronPrerequisiteFailed("dependency event id is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", values["artifact_sha256"]):
+        raise CronPrerequisiteFailed("dependency artifact SHA is invalid")
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", values["upstream_job_id"]
+    ):
+        raise CronPrerequisiteFailed("dependency upstream job id is invalid")
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", values["upstream_run_id"]
+    ):
+        raise CronPrerequisiteFailed("dependency upstream run id is invalid")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", values["business_date"]):
+        raise CronPrerequisiteFailed("dependency business date is invalid")
+    if not Path(values["artifact_path"]).expanduser().is_absolute():
+        raise CronPrerequisiteFailed("dependency artifact path is invalid")
+    return {env_key: values[event_key] for event_key, env_key in required.items()}
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -3980,8 +4784,16 @@ def _build_job_prompt(
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
     from agent.skill_utils import normalize_skill_lookup_name
 
+    skill_requirements = normalize_skill_requirements(
+        job.get("skill_requirements"), skill_names
+    )
+    required_skills = set((skill_requirements or {}).get("required", []))
+    optional_skills = set((skill_requirements or {}).get("optional", []))
+
     parts = []
     skipped: list[str] = []
+    missing_required: list[str] = []
+    missing_optional: list[str] = []
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -4006,6 +4818,7 @@ def _build_job_prompt(
                 skill_name,
             )
             skipped.append(skill_name)
+            (missing_required if skill_name in required_skills else missing_optional).append(skill_name)
             continue
 
         try:
@@ -4013,11 +4826,13 @@ def _build_job_prompt(
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
+            (missing_required if skill_name in required_skills else missing_optional).append(skill_name)
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
+            (missing_required if skill_name in required_skills else missing_optional).append(skill_name)
             continue
 
         # Bump usage so the curator sees this skill as actively used.
@@ -4038,6 +4853,17 @@ def _build_job_prompt(
         )
 
     if skipped:
+        _record_skill_load(job, {
+            "mode": "explicit" if skill_requirements is not None else "legacy",
+            "status": "blocked" if missing_required else "degraded",
+            "loaded": [name for name in skill_names if name not in skipped],
+            "missing_required": missing_required,
+            "missing_optional": missing_optional,
+        })
+        if missing_required:
+            raise CronPrerequisiteFailed(
+                "required skill(s) missing: " + ", ".join(missing_required)
+            )
         notice = (
             f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
             f"and were skipped: {', '.join(skipped)}. "
@@ -4045,6 +4871,15 @@ def _build_job_prompt(
             f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
         )
         parts.insert(0, notice)
+
+    if skill_requirements is not None and not skipped:
+        _record_skill_load(job, {
+            "mode": "explicit",
+            "status": "ready",
+            "loaded": list(skill_names),
+            "missing_required": [],
+            "missing_optional": [],
+        })
 
     stable_prefix = None
     if prompt:
@@ -4706,8 +5541,17 @@ def run_job(
             _job_workdir = None
 
         try:
+            dependency_env = _dependency_event_script_env(job)
+            script_kwargs = {
+                "workdir": _job_workdir,
+                "cancel_event": cancel_event,
+            }
+            if dependency_env:
+                script_kwargs["extra_env"] = dependency_env
             ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+                job,
+                script_path,
+                **script_kwargs,
             )
         except Exception as exc:
             logger.exception(
@@ -6203,6 +7047,196 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         heartbeat_thread.join(timeout=1.0)
 
 
+_DEPENDENCY_EVENT_SCHEMA = "hermes.cron.dependency-event.v1"
+_DEPENDENCY_VALIDATOR = "sha256_readback_v1"
+
+
+def _dependency_business_date(execution: dict, timezone_name: str) -> str:
+    try:
+        timezone_value = ZoneInfo(timezone_name)
+    except Exception as exc:
+        raise ValueError(f"invalid dependency timezone: {timezone_name!r}") from exc
+    claimed_at = execution.get("claimed_at")
+    if not isinstance(claimed_at, str):
+        raise ValueError("upstream execution is missing claimed_at")
+    try:
+        claimed = datetime.fromisoformat(claimed_at)
+    except ValueError as exc:
+        raise ValueError("upstream execution claimed_at is invalid") from exc
+    if claimed.tzinfo is None:
+        raise ValueError("upstream execution claimed_at must be timezone-aware")
+    business_date = claimed.astimezone(timezone_value).date()
+    now = _hermes_now()
+    if now.tzinfo is None:
+        raise ValueError("scheduler time must be timezone-aware")
+    if business_date != now.astimezone(timezone_value).date():
+        raise ValueError("upstream execution business date is stale")
+    return business_date.isoformat()
+
+
+def _read_dependency_artifact(
+    upstream_job: dict, dependency: dict, business_date: str
+) -> dict:
+    if dependency.get("validator") != _DEPENDENCY_VALIDATOR:
+        raise ValueError(f"dependency validator must be {_DEPENDENCY_VALIDATOR!r}")
+    workdir = Path(str(upstream_job.get("workdir") or "")).expanduser().resolve()
+    if not workdir.is_dir():
+        raise ValueError("upstream workdir is not an existing directory")
+    template = str(dependency.get("artifact_path") or "").strip()
+    if template.count("{business_date}") != 1:
+        raise ValueError(
+            "dependency artifact_path must contain one {business_date} placeholder"
+        )
+    relative = Path(template.replace("{business_date}", business_date))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("dependency artifact_path must stay inside upstream workdir")
+    target = workdir / relative
+    if target.is_symlink():
+        raise ValueError("dependency artifact must not be a symlink")
+    try:
+        resolved = target.resolve(strict=True)
+        resolved.relative_to(workdir)
+    except (OSError, ValueError) as exc:
+        raise ValueError("dependency artifact is missing or outside upstream workdir") from exc
+    if not resolved.is_file():
+        raise ValueError("dependency artifact is not a regular file")
+    minimum_bytes = dependency.get("artifact_min_bytes", 1)
+    if type(minimum_bytes) is not int or minimum_bytes < 1:
+        raise ValueError("dependency artifact_min_bytes must be a positive integer")
+    before = resolved.stat()
+    payload = resolved.read_bytes()
+    after = resolved.stat()
+    if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_ino, after.st_size, after.st_mtime_ns
+    ):
+        raise ValueError("dependency artifact changed during readback")
+    if len(payload) < minimum_bytes:
+        raise ValueError("dependency artifact is smaller than artifact_min_bytes")
+    return {
+        "path": str(resolved),
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _dependency_event_id(identity: dict) -> str:
+    encoded = json.dumps(
+        identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _queue_one_hop_dependents(upstream_job: dict, execution: dict) -> int:
+    upstream_id = str(upstream_job.get("id") or "")
+    if not upstream_id or upstream_job.get("depends_on"):
+        return 0
+    if (
+        not isinstance(execution, dict)
+        or execution.get("job_id") != upstream_id
+        or execution.get("status") != "completed"
+        or not execution.get("id")
+    ):
+        return 0
+    latest = latest_completed_execution(upstream_id)
+    if not isinstance(latest, dict) or latest.get("id") != execution.get("id"):
+        logger.warning("Job '%s': dependency event rejected because execution is not latest completed", upstream_id)
+        return 0
+    dependents = [
+        (candidate, candidate.get("depends_on"))
+        for candidate in load_jobs()
+        if isinstance(candidate.get("depends_on"), dict)
+        and candidate["depends_on"].get("upstream_job_id") == upstream_id
+        and candidate["depends_on"].get("mode") == "success_artifact"
+    ]
+    if len(dependents) != 1:
+        if dependents:
+            logger.error("Job '%s': expected one dependency consumer, found %d", upstream_id, len(dependents))
+        return 0
+    downstream, dependency = dependents[0]
+    if not downstream.get("enabled", True) or downstream.get("state") == "paused":
+        return 0
+    try:
+        business_date = _dependency_business_date(
+            execution, str(dependency.get("timezone") or "").strip()
+        )
+        artifact = _read_dependency_artifact(upstream_job, dependency, business_date)
+    except (OSError, ValueError) as exc:
+        logger.error("Job '%s': dependency event validation failed: %s", upstream_id, exc)
+        return 0
+    identity = {
+        "schema": _DEPENDENCY_EVENT_SCHEMA,
+        "upstream_job_id": upstream_id,
+        "upstream_run_id": str(execution["id"]),
+        "downstream_job_id": str(downstream.get("id") or ""),
+        "business_date": business_date,
+        "artifact_sha256": artifact["sha256"],
+        "validator_name": _DEPENDENCY_VALIDATOR,
+        "validator_status": "passed",
+    }
+    event_id = _dependency_event_id(identity)
+    current = downstream.get("dependency_event")
+    if isinstance(current, dict) and current.get("id") == event_id:
+        return 0
+    event = {
+        **identity,
+        "id": event_id,
+        "state": "ready",
+        "artifact_path": artifact["path"],
+        "artifact_size": artifact["size"],
+        "validator": {"name": _DEPENDENCY_VALIDATOR, "status": "passed"},
+        "created_at": _hermes_now().isoformat(),
+    }
+    if update_job(
+        str(downstream.get("id") or ""),
+        {"dependency_event": event, "next_run_at": _hermes_now().isoformat()},
+    ) is None:
+        return 0
+    return 1
+
+
+def _dependency_event_error(job: dict) -> Optional[str]:
+    dependency = job.get("depends_on")
+    if not isinstance(dependency, dict):
+        return None
+    event = job.get("dependency_event")
+    if not isinstance(event, dict):
+        return "dependency event is missing"
+    if event.get("schema") != _DEPENDENCY_EVENT_SCHEMA:
+        return "dependency event schema is invalid"
+    if event.get("state") != "ready":
+        return "dependency event is not ready"
+    upstream_id = str(dependency.get("upstream_job_id") or "")
+    if not upstream_id or event.get("upstream_job_id") != upstream_id:
+        return "dependency event upstream identity is invalid"
+    if event.get("downstream_job_id") != job.get("id"):
+        return "dependency event downstream identity is invalid"
+    if event.get("validator") != {"name": _DEPENDENCY_VALIDATOR, "status": "passed"}:
+        return "dependency event validator status is not passed"
+    latest = latest_completed_execution(upstream_id)
+    if not isinstance(latest, dict) or latest.get("id") != event.get("upstream_run_id"):
+        return "dependency event does not reference the latest completed upstream run"
+    try:
+        business_date = _dependency_business_date(
+            latest, str(dependency.get("timezone") or "").strip()
+        )
+        if event.get("business_date") != business_date:
+            return "dependency event business date is stale"
+        upstream_job = next(
+            (candidate for candidate in load_jobs() if candidate.get("id") == upstream_id),
+            None,
+        )
+        if not isinstance(upstream_job, dict):
+            return "dependency upstream job is missing"
+        artifact = _read_dependency_artifact(upstream_job, dependency, business_date)
+    except (OSError, ValueError) as exc:
+        return str(exc)
+    if artifact["path"] != event.get("artifact_path"):
+        return "dependency artifact path does not match the event"
+    if artifact["sha256"] != event.get("artifact_sha256"):
+        return "dependency artifact SHA does not match the event"
+    return None
+
+
 def run_one_job(
     job: dict,
     *,
@@ -6335,6 +7369,24 @@ def _run_one_job_body(
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
+        dependency_error = _dependency_event_error(job)
+        if dependency_error is not None:
+            raise CronPrerequisiteFailed(
+                f"Cron dependency prerequisite failed: {dependency_error}"
+            )
+        if isinstance(job.get("depends_on"), dict):
+            event = job.get("dependency_event")
+            event_id = event.get("id") if isinstance(event, dict) else None
+            consumed_event = consume_dependency_event(
+                job["id"], str(event_id or ""), str(execution_id)
+            )
+            if consumed_event is None:
+                raise CronPrerequisiteFailed(
+                    "Cron dependency prerequisite failed: dependency event "
+                    "was already consumed or changed"
+                )
+            job["dependency_event"] = consumed_event
+
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
         # gateway profiles / room→profile multiplexing), and cron fires from
@@ -6359,6 +7411,11 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        # Product acceptance needs a run start that is strictly earlier than
+        # anything this run can write. Taken here, immediately before dispatch,
+        # in business time (_hermes_now) so it is comparable with the ``as_of``
+        # stamps business products carry — the system clock is UTC.
+        _run_started_at = _hermes_now()
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
@@ -6446,6 +7503,46 @@ def _run_one_job_body(
                     "(tool subprocess was killed mid-flight)."
                 )
 
+            artifact_response = final_response
+            if success and job.get("artifact_path"):
+                try:
+                    if str(job.get("id") or "") in _MONTHLY_PRODUCER_REPORT_TYPES:
+                        artifact_response = _monthly_producer_artifact_response(job)
+                    artifact_file = _write_job_artifact(job, artifact_response)
+                    if verbose:
+                        logger.info("Business artifact saved to: %s", artifact_file)
+                except Exception as artifact_exc:
+                    success = False
+                    error = f"Business artifact write failed: {artifact_exc}"
+                    logger.error("Job '%s': %s", job["id"], error)
+
+            # Product acceptance (freshness + run binding). A job that declares
+            # a product must have produced it IN THIS RUN; otherwise the run is
+            # a failure no matter how cleanly the agent stopped. Kills the whole
+            # false-green class T40 documented, not just the 风控巡检 instance.
+            if success:
+                _product_error = _verify_job_product_binding(job, _run_started_at)
+                if _product_error:
+                    success = False
+                    error = _product_error
+                    logger.error("Job '%s': %s", job["id"], error)
+                else:
+                    # P5: no declared product at all → there was nothing to bind
+                    # this run to. Gated by cron.product_contract_mode so the
+                    # ledger can be built before the gate is armed.
+                    _contract_gap = _product_contract_gap(job)
+                    if _contract_gap:
+                        _contract_mode = _product_contract_mode()
+                        if _contract_mode == "enforce":
+                            success = False
+                            error = _contract_gap
+                            logger.error("Job '%s': %s", job["id"], error)
+                        elif _contract_mode == "observe":
+                            logger.warning(
+                                "Job '%s': %s [mode=observe, last_status unchanged]",
+                                job["id"], _contract_gap,
+                            )
+
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
@@ -6490,6 +7587,10 @@ def _run_one_job_body(
                     _summarize_cron_failure_for_delivery(job, error)
                     + _failure_streak_nudge(job)
                 )
+                if success:
+                    deliver_content = _render_blocked_receipt_for_delivery(
+                        deliver_content, job
+                    )
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
@@ -6637,12 +7738,25 @@ def _run_one_job_body(
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
-        finish_execution(
+        terminal_execution = finish_execution(
             execution_id,
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        if (
+            success
+            and isinstance(terminal_execution, dict)
+            and terminal_execution.get("status") == "completed"
+            and not _is_strict_blocked_receipt(artifact_response)
+        ):
+            try:
+                _queue_one_hop_dependents(job, terminal_execution)
+            except Exception as dependency_exc:
+                logger.error(
+                    "Job '%s': failed to queue dependent after durable success: %s",
+                    job["id"], dependency_exc,
+                )
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
