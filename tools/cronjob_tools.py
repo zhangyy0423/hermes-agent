@@ -1129,3 +1129,15 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+# Beichen retention bridge (merge 2026-09-23): official moved the prompt-scan
+# family into tools/cronjob_prompt_scan.py; the retained Beichen scheduler
+# imports these symbols from this module. Re-export instead of duplicating.
+try:
+    from tools.cronjob_prompt_scan import (  # noqa: F401
+        _scan_cron_prompt,
+        _scan_cron_skill_assembled,
+    )
+except ImportError:  # pragma: no cover — official module layout change guard
+    pass

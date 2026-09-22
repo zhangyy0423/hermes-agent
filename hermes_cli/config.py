@@ -4087,3 +4087,125 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+# ---- Beichen retention (merge 2026-09-23): cron model drift guard family ----
+# Official removed this mechanism post-20260819 (superseded by catalog cache
+# keyed on token state); the Beichen scheduler (retained in full for the
+# precheck/BLOCKED-receipt/as_of-opt-in production machinery) still imports
+# these. Self-contained block, no overlap with official code.
+def cron_model_drift_guard_enabled(
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether cron must fail closed on unpinned inference drift.
+
+    Only the literal YAML boolean ``false`` disables this spend-safety guard.
+    Missing, malformed, or non-boolean values stay fail-closed. When *config*
+    is omitted, load the active merged configuration so CLI warnings honor the
+    same user/managed setting as the scheduler.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return True
+    if not isinstance(config, dict):
+        return True
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return True
+    return cron_config.get("model_drift_guard", True) is not False
+
+
+def _cron_fleet_default_covers_axis(
+    axis: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when cron.model / cron.model_provider covers *axis*.
+
+    An axis covered by the explicit cron-fleet default no longer follows the
+    global model/provider at fire time, so the drift guard never engages for
+    it and switch-time warnings would be false alarms.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return False
+    if not isinstance(config, dict):
+        return False
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return False
+    key = "model" if axis == "model" else "model_provider"
+    value = cron_config.get(key)
+    return isinstance(value, str) and bool(value.strip())
+
+
+_CRON_MODEL_IMPACT_JOB_LIMIT = 50
+_CRON_MODEL_IMPACT_ID_LIMIT = 256
+_CRON_MODEL_IMPACT_NAME_LIMIT = 120
+
+
+def _model_assignment_text(value: Any) -> str:
+    """Return a trimmed scalar model/provider value, or empty for malformed data."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def resolve_cron_model_drift_defaults(
+    config: Any,
+    *,
+    environ: Optional[Dict[str, str]] = None,
+) -> Tuple[str, str]:
+    """Resolve the global provider/model values cron compares against snapshots.
+
+    Mirrors the scheduler's global-model precedence: a truthy configured model
+    wins ``HERMES_MODEL``; the environment is only a fallback. Per-job and cron
+    fleet defaults are handled by the caller/classifier because they suppress a
+    drift axis rather than changing the global assignment.
+    """
+    env = os.environ if environ is None else environ
+    provider = ""
+    model = _model_assignment_text(env.get("HERMES_MODEL", ""))
+    model_config = config.get("model") if isinstance(config, dict) else None
+    if isinstance(model_config, str):
+        configured_model = model_config.strip()
+        if configured_model:
+            model = configured_model
+    elif isinstance(model_config, dict):
+        provider = _model_assignment_text(model_config.get("provider"))
+        configured_model = _model_assignment_text(
+            model_config.get("default")
+            or model_config.get("model")
+            or model_config.get("name")
+        )
+        if configured_model:
+            model = configured_model
+    return provider, model
+
+
+def cron_model_drift_axes(
+    job: Any,
+    *,
+    current_provider: Any = "",
+    current_model: Any = "",
+    config: Any = None,
+) -> List[str]:
+    """Return the unpinned axes that the fail-closed cron guard would block."""
+    if not isinstance(job, dict) or not cron_model_drift_guard_enabled(config):
+        return []
+
+    current = {
+        "provider": _model_assignment_text(current_provider).lower(),
+        "model": _model_assignment_text(current_model).lower(),
+    }
+    drifted: List[str] = []
+    for axis in ("provider", "model"):
+        if _cron_fleet_default_covers_axis(axis, config):
+            continue
+        if _model_assignment_text(job.get(axis)):
+            continue
+        snapshot = _model_assignment_text(job.get(f"{axis}_snapshot")).lower()
+        if snapshot and current[axis] and snapshot != current[axis]:
+            drifted.append(axis)
+    return drifted

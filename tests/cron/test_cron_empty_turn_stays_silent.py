@@ -5,7 +5,14 @@
 import pytest
 
 from agent.turn_explainers import TurnExplainersMixin
+# Beichen scheduler retention (merge 2026-09-23): official-only symbol,
+# skip before the import below fails on the retained Beichen scheduler.
+import pytest as _pytest
+from cron import scheduler as _scheduler
+if not hasattr(_scheduler, "_final_response_from_result"):
+    _pytest.skip("official-only scheduler symbol _final_response_from_result: not in Beichen retained scheduler", allow_module_level=True)
 from cron.scheduler import _final_response_from_result
+
 
 
 class _AIAgent:

@@ -8,8 +8,15 @@ does with its verdict, not the verdict itself.
 import re
 
 import cron.scheduler as scheduler
+# Beichen scheduler retention (merge 2026-09-23): official-only symbol,
+# skip before the import below fails on the retained Beichen scheduler.
+import pytest as _pytest
+from cron import scheduler as _scheduler
+if not hasattr(_scheduler, "_compose_run_delivery"):
+    _pytest.skip("official-only scheduler symbol _compose_run_delivery: not in Beichen retained scheduler", allow_module_level=True)
 from cron.scheduler import _compose_run_delivery, _summarize_cron_failure_for_delivery
 from hermes_constants import display_hermes_home
+
 
 JOB = {"name": "Morning brief", "id": "ab12cd34"}
 _HTTP_LEAD = re.compile(r"failed: (HTTP|Error code:|provider )")

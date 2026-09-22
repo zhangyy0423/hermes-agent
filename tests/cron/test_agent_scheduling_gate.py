@@ -28,8 +28,11 @@ ALWAYS_DISABLED = ["messaging", "clarify"]
 
 class TestGateOffDefault:
     def test_empty_config_denies_cronjob(self):
+        # Beichen retained scheduler: "memory" is also always disabled —
+        # cron agents are constructed with skip_memory=True, so exposing the
+        # tool would only hand the model an unbacked tool that fails.
         assert _resolve_cron_disabled_toolsets({}) == [
-            "cronjob", "messaging", "clarify",
+            "cronjob", "messaging", "clarify", "memory",
         ]
 
     def test_none_config_denies_cronjob(self):
