@@ -947,7 +947,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
         if cache_meta_out is not None and not items:
             _ttl = mcp_field(result, "ttl_ms", "ttlMs")
             _scope = mcp_field(result, "cache_scope", "cacheScope")
-            if _ttl is not None:
+            if _ttl:
                 cache_meta_out["ttl_ms"] = _ttl
             if _scope is not None:
                 cache_meta_out["cache_scope"] = _scope
@@ -6980,7 +6980,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             for mcp_tool in server._tools:
                 if not _should_register(mcp_tool.name):
                     continue
-                schema_obj = getattr(mcp_tool, "inputSchema", None)
+                schema_obj = mcp_field(mcp_tool, "input_schema", "inputSchema")
                 tools_payload.append({
                     "name": mcp_tool.name,
                     "description": mcp_tool.description or "",

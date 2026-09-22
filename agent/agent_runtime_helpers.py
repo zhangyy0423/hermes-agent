@@ -2268,7 +2268,9 @@ def anthropic_prompt_cache_policy(
     eff_model = eff_model if isinstance(eff_model, str) else str(eff_model or '')
     model_lower = eff_model.lower()
     provider_lower = eff_provider.lower()
-    is_claude = "claude" in model_lower
+    is_claude = "claude" in model_lower or model_lower.strip().startswith(
+        ("opus", "sonnet", "haiku")
+    )
     # Kimi / Moonshot family via OpenRouter: same cache_control wire format
     # as Claude on OpenRouter (envelope layout).  Without this branch
     # moonshotai/kimi-k2.6 falls through to (False, False), serving ~1%

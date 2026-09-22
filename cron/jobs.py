@@ -38,6 +38,54 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
 
+
+class CronSkillContractInvalid(ValueError):
+    """A declared skill contract is malformed or incomplete."""
+
+
+def normalize_skill_requirements(
+    skill_requirements: Any,
+    skills: List[str],
+) -> Optional[Dict[str, List[str]]]:
+    """Validate an explicit required/optional skill classification."""
+    if skill_requirements is None:
+        return None
+    if not isinstance(skill_requirements, dict):
+        raise CronSkillContractInvalid("skill_requirements must be an object")
+    if set(skill_requirements) != {"required", "optional"}:
+        raise CronSkillContractInvalid(
+            "skill_requirements must contain exactly required and optional"
+        )
+    normalized: Dict[str, List[str]] = {}
+    for key in ("required", "optional"):
+        values = skill_requirements.get(key)
+        if not isinstance(values, list):
+            raise CronSkillContractInvalid(
+                f"skill_requirements.{key} must be an array of strings"
+            )
+        names: List[str] = []
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise CronSkillContractInvalid(
+                    f"skill_requirements.{key} must contain non-empty strings"
+                )
+            name = value.strip()
+            if name in names:
+                raise CronSkillContractInvalid(
+                    f"skill_requirements.{key} must not contain duplicates"
+                )
+            names.append(name)
+        normalized[key] = names
+    required = set(normalized["required"])
+    optional = set(normalized["optional"])
+    if required & optional:
+        raise CronSkillContractInvalid("required and optional skills must not overlap")
+    if required | optional != set(skills):
+        raise CronSkillContractInvalid(
+            "required and optional skills must exactly classify normalized skills"
+        )
+    return normalized
+
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
 
@@ -2190,6 +2238,48 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             jobs[i] = updated
             save_jobs(jobs)
             return _normalize_job_record(jobs[i])
+    return None
+
+
+def set_job_skill_load(
+    job_id: str, skill_load: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Persist a scheduler skill-load receipt without changing run state."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") == job_id:
+                job["last_skill_load"] = copy.deepcopy(skill_load)
+                _save_jobs_unlocked(jobs)
+                return copy.deepcopy(job)
+    return None
+
+
+def consume_dependency_event(
+    job_id: str, event_id: str, execution_id: str
+) -> Optional[Dict[str, Any]]:
+    """Atomically transition one ready dependency event to consumed."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            event = job.get("dependency_event")
+            if (
+                not isinstance(event, dict)
+                or event.get("id") != event_id
+                or event.get("state") != "ready"
+            ):
+                return None
+            consumed = copy.deepcopy(event)
+            consumed.update(
+                state="consumed",
+                consumed_at=_hermes_now().isoformat(),
+                consumed_by_execution_id=str(execution_id),
+            )
+            job["dependency_event"] = consumed
+            _save_jobs_unlocked(jobs)
+            return copy.deepcopy(consumed)
     return None
 
 

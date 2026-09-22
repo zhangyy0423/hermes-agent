@@ -266,6 +266,18 @@ def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
+def latest_completed_execution(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return the newest completed attempt for a job."""
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT * FROM executions
+               WHERE job_id=? AND status='completed'
+               ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT 1""",
+            (str(job_id),),
+        ).fetchone()
+    return _record(row)
+
+
 def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Load latest execution for many jobs in one indexed query."""
     clean = [str(job_id) for job_id in dict.fromkeys(job_ids) if job_id]

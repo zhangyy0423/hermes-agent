@@ -69,6 +69,22 @@ def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     assert executions.latest_execution("immutable")["status"] == "completed"
 
 
+def test_latest_completed_execution_ignores_newer_failed_attempt(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    completed = executions.create_execution("dependency-source", source="direct")
+    failed = executions.create_execution("dependency-source", source="direct")
+    executions.finish_execution(failed["id"], success=False, error="interrupted")
+    successful = executions.finish_execution(completed["id"], success=True)
+
+    assert executions.latest_execution("dependency-source")["id"] == failed["id"]
+    assert (
+        executions.latest_completed_execution("dependency-source")["id"]
+        == successful["id"]
+    )
+
+
 def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)

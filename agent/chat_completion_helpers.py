@@ -2403,6 +2403,43 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+def _named_provider_config_api_mode(provider: str) -> str:
+    """api_mode declared by the ``providers.<name>`` block, or ``""``.
+
+    The primary resolution path honors a configured provider's own
+    ``api_mode`` (``runtime_provider._resolve_named_custom_runtime`` /
+    ``_try_resolve_from_custom_pool``).  ``try_activate_fallback`` used to
+    derive the wire only from the chain entry itself, the literal provider
+    name ``anthropic``, and the base_url shape — so a provider block that
+    declares ``api_mode: anthropic_messages`` was silently downgraded to
+    ``chat_completions`` on the failover path.
+
+    That downgrade is not cosmetic: an Anthropic-wire base_url deliberately
+    omits ``/v1`` (the Anthropic SDK appends ``/v1/messages`` itself), so the
+    OpenAI client built for the downgraded mode POSTs
+    ``{base_url}/chat/completions`` — a path such gateways do not route.  The
+    observed symptom was an HTML ``302 Found`` to an SSO login page rather
+    than a JSON API error.
+
+    Returns a canonical api_mode, or ``""`` when the block declares none /
+    is absent / config cannot be read.
+    """
+    if not str(provider or "").strip():
+        return ""
+    try:
+        from hermes_cli.runtime_provider import (
+            _get_named_custom_provider,
+            _parse_api_mode,
+        )
+
+        block = _get_named_custom_provider(provider)
+        if not isinstance(block, dict):
+            return ""
+        return _parse_api_mode(block.get("api_mode")) or ""
+    except Exception:  # never let a config-shape problem break failover
+        return ""
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -2548,6 +2585,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # an explicit "chat_completions" — and suppresses all re-detection below.
         fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
         fb_api_mode = "chat_completions"
+        # A ``providers.<name>`` block that declares its own api_mode is an
+        # explicit user declaration, exactly like an api_mode on the chain
+        # entry — see _named_provider_config_api_mode for why ignoring it
+        # produced an unroutable URL (and an SSO 302) instead of an API call.
+        fb_cfg_api_mode = (
+            "" if fb_api_mode_explicit
+            else _named_provider_config_api_mode(fb_provider)
+        )
         if fb_api_mode_explicit:
             fb_api_mode = str(fb.get("api_mode")).strip()
         elif fb_provider == "anthropic":
@@ -2556,6 +2601,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             # base_url uses the provider's default endpoint and must still
             # resolve to anthropic_messages, not chat_completions.
             fb_api_mode = "anthropic_messages"
+        elif fb_cfg_api_mode:
+            fb_api_mode = fb_cfg_api_mode
         elif fb_base_url_hint:
             _orig_url = fb_base_url_hint.rstrip("/").lower()
             if (
