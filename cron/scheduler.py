@@ -2166,6 +2166,83 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+# ── A7 (F-T31 apply): disk-floor guard for the cron tick ───────────────────
+# The 2026-09-02 incident showed the tick hammering ENOSPC every ~28s for
+# 12.7 minutes while ``executions.db`` could not even record that its own
+# writes were failing — a 12.7-minute black hole in the ledger. When the
+# volume backing HERMES_HOME is critically low the tick must PARK (skip
+# dispatch), not spin: every job it would launch writes a claim row to
+# executions.db and a temp file next to the tick lock, both of which fail
+# under ENOSPC, including the "I failed" receipt itself. Emit exactly one
+# typed LOCAL_DISK_BELOW_FLOOR log per throttle window so a full volume yields
+# a signal instead of a log storm. Floor default mirrors
+# backtest-engine/data/update_klines.py (DEFAULT_MIN_FREE_GIB = 10.0) and is
+# overridable via HERMES_CRON_MIN_FREE_GIB (0 disables the guard).
+DEFAULT_CRON_MIN_FREE_GIB = 10.0
+_DISK_FLOOR_LOG_INTERVAL_SECONDS = 300.0
+_last_disk_floor_log_at: Optional[float] = None
+
+
+def _get_cron_min_free_bytes() -> int:
+    """Free-space floor for the cron tick in bytes (env-overridable)."""
+    raw = os.environ.get("HERMES_CRON_MIN_FREE_GIB")
+    gib = DEFAULT_CRON_MIN_FREE_GIB
+    if raw is not None:
+        try:
+            gib = max(0.0, float(raw))
+        except (TypeError, ValueError):
+            gib = DEFAULT_CRON_MIN_FREE_GIB
+    return int(gib * (1024 ** 3))
+
+
+def _check_cron_disk_floor(now: Optional[float] = None) -> Optional[dict]:
+    """Return None when free space is at/above the floor (OK to dispatch).
+
+    When below the floor, return a typed receipt
+    ``{"reason": "LOCAL_DISK_BELOW_FLOOR", "free_bytes", "floor_bytes", "path"}``
+    and log it at most once per ``_DISK_FLOOR_LOG_INTERVAL_SECONDS`` so a full
+    volume does not produce a per-tick log storm.
+
+    A failure to *measure* free space (``shutil.disk_usage`` raising) is
+    treated as NOT-below-floor: the guard must never itself become the reason
+    an otherwise-healthy tick stops dispatching.
+    """
+    global _last_disk_floor_log_at
+    floor_bytes = _get_cron_min_free_bytes()
+    if floor_bytes <= 0:
+        return None
+    try:
+        home = _get_hermes_home()
+        free_bytes = int(shutil.disk_usage(home).free)
+    except OSError:
+        # Cannot measure — do not block a healthy tick on a measurement error.
+        return None
+    if free_bytes >= floor_bytes:
+        return None
+    receipt = {
+        "reason": "LOCAL_DISK_BELOW_FLOOR",
+        "free_bytes": free_bytes,
+        "floor_bytes": floor_bytes,
+        "path": str(home),
+    }
+    _now = time.monotonic() if now is None else now
+    if (
+        _last_disk_floor_log_at is None
+        or _now - _last_disk_floor_log_at >= _DISK_FLOOR_LOG_INTERVAL_SECONDS
+    ):
+        _last_disk_floor_log_at = _now
+        logger.error(
+            "Cron tick parked — LOCAL_DISK_BELOW_FLOOR: free=%d bytes < "
+            "floor=%d bytes on %s. Dispatch is suspended until free space "
+            "recovers; free the volume (e.g. ~/.hermes/logs, cron/output) to "
+            "resume.",
+            free_bytes,
+            floor_bytes,
+            home,
+        )
+    return receipt
+
+
 # Errnos that mean "another ticker (or manual tick) holds the tick lock",
 # as opposed to a real failure opening/locking the file.  Everything else —
 # most importantly EMFILE/ENFILE (fd exhaustion, #87644) and EACCES on
@@ -7994,6 +8071,16 @@ def tick(
 
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
+            return 0
+
+        # A7 (F-T31 apply): park the tick when the volume backing HERMES_HOME
+        # is critically low. Under ENOSPC every dispatched job's claim row and
+        # temp files fail to write — including the failure receipt itself —
+        # producing the 12.7-minute ledger black hole seen on 2026-09-02.
+        # Skipping dispatch (rather than spinning) leaves due jobs for the next
+        # tick once space recovers, and emits one typed LOCAL_DISK_BELOW_FLOOR
+        # log per window instead of a per-tick storm.
+        if _check_cron_disk_floor() is not None:
             return 0
 
         # Dead-owner claim reclaim (#86721): execution rows carry their owner
