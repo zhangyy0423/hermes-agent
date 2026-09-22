@@ -33,6 +33,7 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "access_key",
     "client_secret",
     "password",
     "auth",
@@ -40,6 +41,7 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "session",
     "secret",
     "key",
+    "ticket",
     "code",           # OAuth authorization codes
     "signature",      # pre-signed URL signatures
     "x-amz-signature",
@@ -55,6 +57,7 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "access_key",
     "client_secret",
     "password",
     "auth",
@@ -1424,4 +1427,8 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        # F-T31 A8 (2026-09-22): logs are an egress boundary with no
+        # round-trip workflow semantics — credential-shaped URL query
+        # params (Lark WS access_key/ticket) must be masked here even
+        # though tool flows keep actionable OAuth URLs intact.
+        return redact_sensitive_text(original, redact_url_credentials=True)
