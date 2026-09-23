@@ -430,7 +430,7 @@ def latest_completed_execution(job_id: str) -> Optional[Dict[str, Any]]:
                ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT 1""",
             (str(job_id),),
         ).fetchone()
-    return _record(row)
+    return dict(row) if row is not None else None
 
 
 def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
