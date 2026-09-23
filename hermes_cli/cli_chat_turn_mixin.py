@@ -365,6 +365,19 @@ class CLIChatTurnMixin:
         except Exception as exc:
             logging.error("run_conversation raised: %s", exc, exc_info=True)
             _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
+            # F-T31 A6: network-class turn failure -> typed session breakpoint
+            # receipt in the transcript (2026-09-02 §4: five sessions froze
+            # silently on the DNS outage; the returning human had no marker).
+            try:
+                from agent.session_breakpoint_receipt import maybe_append_network_breakpoint
+                maybe_append_network_breakpoint(
+                    self.conversation_history, exc,
+                    provider=str(getattr(self.agent, "provider", "") or self.provider or ""),
+                    model=str(getattr(self.agent, "model", "") or self.model or ""),
+                    error_summary=_summary,
+                )
+            except Exception:
+                pass  # receipt is decoration; never break the error path
             from hermes_cli.cli_chat_error_copy import chat_error_response
             turn.result = {
                 "final_response": chat_error_response(

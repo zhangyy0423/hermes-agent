@@ -2069,9 +2069,59 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     return _sequential_pool
 
 
+# ---------------------------------------------------------------------------
+# Health lane (F-T31 A2): watchdog / merge / health-gate jobs get their own
+# 2-worker pool so a wall-clock-unbounded LLM rung occupying the parallel
+# pool cannot starve them. Observed 2026-09-02 §5: one 38m40s LLM rung held
+# the (max_workers=2) parallel pool while the 5-minute watchdog's claims
+# spaced 49.7 minutes apart and the hourly interruption merge skipped a
+# whole hour slot. Health-class jobs are lightweight script/no_agent work;
+# giving them a dedicated lane bounds their claim spacing at their cadence
+# regardless of what the LLM lane is doing.
+# ---------------------------------------------------------------------------
+_HEALTH_LANE_WORKERS = 2
+_health_lane_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+_HEALTH_CLASS_NAME_HINTS = (
+    "watchdog", "归并", "健康", "门禁", "巡检", "monitor", "health",
+)
+
+
+def _is_health_class_job(job: dict) -> bool:
+    """True for watchdog/merge/health-gate style jobs that must claim on cadence.
+
+    Explicit opt-in wins: ``job["health_class"] is True`` forces the lane (a
+    named LLM job could never sneak in via name matching), and
+    ``job["health_class"] is False`` forces it off. Without an explicit flag
+    only no_agent (script) jobs whose name carries a health keyword are
+    classified in — agent jobs stay on the parallel lane because their run
+    time is dominated by the LLM, not by the scheduling lane.
+    """
+    flag = job.get("health_class")
+    if flag is True:
+        return True
+    if flag is False:
+        return False
+    if job.get("no_agent") or (job.get("script") or "").strip():
+        name = str(job.get("name") or "").lower()
+        return any(hint in name for hint in _HEALTH_CLASS_NAME_HINTS)
+    return False
+
+
+def _get_health_lane_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """Return (or create) the persistent health-lane pool (dedicated workers)."""
+    global _health_lane_pool
+    if _health_lane_pool is None:
+        _health_lane_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_HEALTH_LANE_WORKERS,
+            thread_name_prefix="cron-health",
+        )
+    return _health_lane_pool
+
+
 def _shutdown_parallel_pool() -> None:
     """Shut down the persistent pools on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool, _health_lane_pool
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
@@ -2079,6 +2129,9 @@ def _shutdown_parallel_pool() -> None:
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
+    if _health_lane_pool is not None:
+        _health_lane_pool.shutdown(wait=True, cancel_futures=False)
+        _health_lane_pool = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -8242,7 +8295,14 @@ def tick(
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
         sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        health_jobs = [
+            j for j in due_jobs
+            if not (j.get("workdir") or "").strip() and _is_health_class_job(j)
+        ]
+        parallel_jobs = [
+            j for j in due_jobs
+            if not (j.get("workdir") or "").strip() and not _is_health_class_job(j)
+        ]
 
         _results: list = []
         _all_futures: list = []
@@ -8379,6 +8439,20 @@ def tick(
         # mark_job_run() updates next_run_at on completion, so the next tick
         # after completion finds the job due again naturally.  No catch-up
         # queue needed.
+        # Health-lane pass (F-T31 A2) — watchdog/merge/health-gate jobs ride a
+        # dedicated 2-worker pool so one wall-clock-unbounded LLM rung in the
+        # parallel lane cannot starve them (2026-09-02 §5: 38m40s rung →
+        # watchdog claims spaced 49.7 min, hourly merge skipped a slot).
+        if health_jobs:
+            health_pool = _get_health_lane_pool()
+            for job in health_jobs:
+                fut = _submit_with_guard(job, health_pool)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
+
         if parallel_jobs:
             pool = _get_parallel_pool(_max_workers)
             for job in parallel_jobs:
