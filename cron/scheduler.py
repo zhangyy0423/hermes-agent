@@ -6267,8 +6267,18 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Max iterations. A job may override the global cap with its own
+        # ``max_turns`` field: long-pipeline research jobs (multi-stage
+        # collect -> analyze -> write -> publish contracts) legitimately need
+        # more tool rounds than the global default, while the global cap keeps
+        # protecting every other job from runaway loops. The wall-clock bound
+        # (agent.gateway_timeout) remains the real safety net either way.
+        max_iterations = (
+            job.get("max_turns")
+            or _cfg.get("agent", {}).get("max_turns")
+            or _cfg.get("max_turns")
+            or 500
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
