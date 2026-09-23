@@ -8011,6 +8011,16 @@ def tick(
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    # Stale-code yield gate — BEFORE the lock race (official #9a7732b45f,
+    # ported at the 2026-09-23 merge). A process whose checkout was updated
+    # under it serves mixed sys.modules (jobs die on ImportErrors); if a
+    # fresher gateway holds the runtime lock, ITS ticker dispatches. With no
+    # fresh holder (desktop-standalone) the tick proceeds.
+    _skew = _should_yield_tick_to_fresh_gateway()
+    if _skew is not None:
+        _log_tick_yield_once(f"boot={_skew[0]} disk={_skew[1]}")
+        raise CronTickYielded(_skew[0], _skew[1])
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -8443,3 +8453,230 @@ def tick(
 
 if __name__ == "__main__":
     tick(verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# Official-symbol compat bridge (merge 2026-09-23, S4d).
+#
+# The official Sep-2026 decomposition moved several names INTO this module
+# (scheduler_provider / scheduler_ownership / scheduler_detached_worker /
+# run_shutdown import them from here), but the Beichen-retained scheduler.py
+# predates them (the fork point predates the official #9a7732b45f stale-yield
+# family and the per-home ledger refactor). This block ports those symbols
+# with Beichen semantics so the official callers import cleanly:
+#
+#   * CronTickYielded / _should_yield_tick_to_fresh_gateway /
+#     _log_tick_yield_once / stale_code_yield_labels — the official
+#     stale-code yield gate. Beichen has no runtime-lock code-fingerprint
+#     infrastructure, so the predicate is fail-open (never yields): the
+#     pre-fork Beichen behavior. The class + labels are still provided
+#     because the official provider's tick loop imports/raises/catches them.
+#   * is_job_running — Beichen's flat (non per-home) in-flight ledger.
+#   * get_running_job_details / get_wedged_job_ids — the restart-drain
+#     readers; Beichen keys its ledger by bare job id (no home tuple), and
+#     the age/allowance model is the one sweep_stale_inflight enforces.
+#   * discard_parallel_pools — official per-home pools; Beichen keeps a
+#     single process-wide pool, so departing homes release nothing.
+#   * _finalize_cron_session — the detached-worker finalize contract
+#     (scheduler_detached_worker); Beichen's run_job inlines this in its
+#     finally, so this is the callable form for the module-level import.
+# ---------------------------------------------------------------------------
+
+class CronTickYielded(RuntimeError):
+    """A stale-code ticker yielded this tick to a fresh gateway.
+
+    Raised by the official ``scheduler_tick`` admission gate before the tick
+    lock when the boot fingerprint differs from disk and a fresher gateway
+    holds the runtime lock. Under the Beichen-retained scheduler this is
+    never raised (the predicate below is fail-open); the class exists so the
+    official provider/CLI import sites resolve.
+    """
+
+    def __init__(self, boot_rev: str, disk_rev: str) -> None:
+        self.boot_rev = boot_rev
+        self.disk_rev = disk_rev
+        super().__init__(
+            f"Cron tick yielded to a fresh gateway process (stale code: "
+            f"booted on {boot_rev}, disk is at {disk_rev})"
+        )
+
+
+_STALE_YIELD_RE = re.compile(r"stale code: booted on (\S+), disk is at (\S+)\)")
+
+
+def stale_code_yield_labels(recorded_error: Optional[str]) -> Optional[tuple]:
+    """``(boot_rev, disk_rev)`` when a persisted ``ticker_last_error`` is a
+    ``CronTickYielded``; None otherwise. ``hermes cron status`` reads this to
+    separate "stale code, firing nothing" from a healthy loop (#117275).
+    Beichen never records such an error, so this always returns None in
+    practice — the parser is kept so the marker text stays diagnosable if a
+    mixed checkout ever writes one.
+    """
+    if not recorded_error or not recorded_error.startswith(CronTickYielded.__name__):
+        return None
+    match = _STALE_YIELD_RE.search(recorded_error)
+    return (match.group(1), match.group(2)) if match else None
+
+
+def _detect_gateway_code_skew() -> Optional[tuple]:
+    """Boot-vs-disk revision skew for THIS process, or None. Test seam over
+    ``gateway.code_skew.detect_code_skew``; a broken import must never take
+    delivery down."""
+    try:
+        from gateway.code_skew import detect_code_skew
+
+        return detect_code_skew()
+    except Exception:
+        return None
+
+
+def _current_gateway_code_sha() -> Optional[str]:
+    """Full revision currently on disk; kept separate from display-shortened
+    skew labels."""
+    try:
+        from gateway.code_skew import current_code_sha
+
+        return current_code_sha()
+    except Exception:
+        return None
+
+
+def _should_yield_tick_to_fresh_gateway() -> Optional[tuple]:
+    """``(boot_rev, disk_rev)`` when THIS process must yield its tick, else None.
+
+    Ported verbatim from the official scheduler (merge 2026-09-23): yields
+    only when ALL hold — code skew, this process is not the cron owner for
+    the profile being ticked, and another live host gateway whose served set
+    covers that profile reports a fresh heartbeat on the disk revision.
+    Every probe failure returns None — yielding is a certainty claim, never
+    a guess.
+    """
+    skew = _detect_gateway_code_skew()
+    if skew is None:
+        return None
+    disk_sha = _current_gateway_code_sha()
+    if disk_sha is None:
+        return None
+    try:
+        from cron.scheduler_ownership import live_gateway_ticking, owns_cron_tick_for
+
+        home = _get_hermes_home()
+        if owns_cron_tick_for(home):
+            return None
+        holder_status = live_gateway_ticking(home)
+        if holder_status is None or holder_status.get("code_sha") != disk_sha:
+            return None
+    except Exception:
+        return None
+    return skew
+
+
+_YIELD_LOG_INTERVAL_SECONDS = 3600.0
+_last_yield_log: dict = {}
+
+
+def _log_tick_yield_once(reason: str) -> None:
+    """Log the yield at error level once per episode (skew signature)."""
+    global _last_yield_log
+    now = time.monotonic()
+    last_reason = _last_yield_log.get("reason")
+    last_at = _last_yield_log.get("at", 0.0)
+    if last_reason != reason or (now - float(last_at)) >= _YIELD_LOG_INTERVAL_SECONDS:
+        logger.error(
+            "Cron tick yielded: this process is running stale code (%s) and a "
+            "fresher gateway owns the runtime lock — jobs will fire from that "
+            "process. Restart this one to reclaim its ticks.",
+            reason)
+    _last_yield_log = {"reason": reason, "at": now}
+
+
+def is_job_running(job_id: str, home=None) -> bool:
+    """True when THIS process has an in-flight run of ``job_id``.
+
+    Beichen's ledger is flat (bare job ids, single-home default profile
+    scope), so the official per-home keying collapses to the id itself. The
+    ``home`` argument is accepted and ignored for import compatibility.
+    """
+    with _running_lock:
+        return job_id in _running_job_ids or job_id in _running_fire_owners
+
+
+def get_running_job_details() -> list:
+    """Per in-flight job: ``{"job_id", "elapsed_s", "worker_pid"}``.
+
+    The restart drain publishes this so ``hermes update`` can say WHICH job it
+    is waiting on. Beichen's ledger carries no per-run worker pid (in-process
+    runs only), so ``worker_pid`` is always None here.
+    """
+    now = time.time()
+    with _running_lock:
+        ids = sorted(_running_job_ids | _running_fire_owners.keys())
+        return [
+            {"job_id": job_id,
+             "elapsed_s": round(now - _running_since[job_id], 1)
+             if job_id in _running_since else None,
+             "worker_pid": None}
+            for job_id in ids
+        ]
+
+
+def get_wedged_job_ids() -> "frozenset[str]":
+    """In-flight job IDs older than their stale-inflight allowance.
+
+    Mirrors the age/allowance model ``sweep_stale_inflight`` enforces (the
+    Beichen flat-ledger equivalent of the official wedged definition): a
+    claim older than ``max(2 * interval, floor)`` can no longer be making
+    progress. Unlike the official per-home version this does NOT cache
+    allowances (Beichen has no per-home keying to cache by); each call parses
+    jobs.json once, which is acceptable for the restart-drain polling path
+    this serves.
+    """
+    now = time.time()
+    with _running_lock:
+        ages = {jid: now - started for jid, started in _running_since.items()
+                if jid in _running_job_ids}
+    if not ages:
+        return frozenset()
+    floor_seconds = _inflight_min_allowance_minutes() * 60.0
+    by_id: dict = {}
+    with contextlib.suppress(Exception):
+        from cron.jobs import load_jobs
+        by_id = {j.get("id"): j for j in load_jobs()}
+    def _allowance(jid: str) -> float:
+        interval_minutes = _job_interval_minutes(by_id.get(jid) or {})
+        return max(floor_seconds, 2.0 * interval_minutes * 60.0) if interval_minutes else floor_seconds
+    return frozenset(jid for jid, age in ages.items() if age >= _allowance(jid))
+
+
+def discard_parallel_pools(home_keys=None) -> None:
+    """Drop the parallel pools of homes this process no longer ticks.
+
+    Official pools are per home (one ThreadPoolExecutor per profile ever
+    ticked). Beichen retains a single process-wide pool, so there is nothing
+    to discard when the ticked-home set changes; the symbol exists so
+    ``cron.scheduler_ownership.register_ticked_homes`` imports cleanly.
+    """
+    return None
+
+
+def _finalize_cron_session(session_db, agent, job_id: str, job_name: str,
+                           cron_session_id: str) -> None:
+    """Title, classify, end and release the cron session after the agent turn
+    has returned — the callable form of the teardown ``run_job``'s finally
+    block inlines, provided for the official detached-worker contract
+    (``cron.scheduler_detached_worker.defer_teardown_to_running_worker``).
+    """
+    _session_db = _BoundedCronSessionDB(session_db, job_id)
+    try:
+        _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+        _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+        if not _set_cron_session_title(_session_db, cron_session_id, _cron_title):
+            _set_cron_session_title(_session_db, cron_session_id, f"cron {job_id}")
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
+    try:
+        if session_db is not None:
+            session_db.close()
+    except (Exception, KeyboardInterrupt) as e:
+        logger.debug("Job '%s': failed to close cron session db: %s", job_id, e)
+# ---- END official-symbol compat bridge (S4d) ----
