@@ -9,6 +9,7 @@ import contextvars
 import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -600,7 +601,15 @@ _HEALTH_CLASS_NAME_HINTS = (
 
 
 def _is_health_class_job(job: dict) -> bool:
-    """Return whether *job* belongs to the dedicated health lane."""
+    """Return whether *job* belongs to the dedicated health lane.
+
+    Jobs with a declared ``workdir`` stay on the ordinary lane: the official scheduler's workdir
+    contract is already a distinct execution context, and this lane must not silently reorder or
+    overlap it. ``health_class`` is currently a raw persisted-job extension; create/update schema
+    registration is intentionally outside this focused adapter.
+    """
+    if (job.get("workdir") or "").strip():
+        return False
     flag = job.get("health_class")
     if flag is True:
         return True
@@ -1287,19 +1296,26 @@ def _cron_inactivity_seconds() -> float:
 # volume from repeatedly dispatching jobs whose claim/output/ledger writes cannot succeed.
 DEFAULT_CRON_MIN_FREE_GIB = 10.0
 _DISK_FLOOR_LOG_INTERVAL_SECONDS = 300.0
-_last_disk_floor_log_at: Optional[float] = None
+_last_disk_floor_log_at: dict[str, float] = {}
 
 
 def _get_cron_min_free_bytes() -> int:
-    """Return the cron disk floor in bytes; ``0`` disables the guard."""
-    raw = cron_env_setting("HERMES_CRON_MIN_FREE_GIB").strip()
+    """Return the configured cron disk floor in bytes; ``0`` disables the guard."""
+    raw = None
+    with contextlib.suppress(Exception):
+        cfg = load_config() or {}
+        raw = (cfg.get("cron") or {}).get("disk_floor_min_free_gib")
     gib = DEFAULT_CRON_MIN_FREE_GIB
-    if raw:
+    if raw is not None:
         try:
-            gib = max(0.0, float(raw))
-        except (TypeError, ValueError):
+            parsed = float(raw)
+            gib = max(0.0, parsed) if math.isfinite(parsed) else DEFAULT_CRON_MIN_FREE_GIB
+        except (TypeError, ValueError, OverflowError):
             gib = DEFAULT_CRON_MIN_FREE_GIB
-    return int(gib * (1024 ** 3))
+    try:
+        return int(gib * (1024 ** 3))
+    except (OverflowError, ValueError):
+        return int(DEFAULT_CRON_MIN_FREE_GIB * (1024 ** 3))
 
 
 def _check_cron_disk_floor(now: Optional[float] = None) -> Optional[dict]:
@@ -1322,12 +1338,13 @@ def _check_cron_disk_floor(now: Optional[float] = None) -> Optional[dict]:
         "floor_bytes": floor_bytes,
         "path": str(home),
     }
+    home_key = hermes_home_key(home)
     current = time.monotonic() if now is None else now
     if (
-        _last_disk_floor_log_at is None
-        or current - _last_disk_floor_log_at >= _DISK_FLOOR_LOG_INTERVAL_SECONDS
+        home_key not in _last_disk_floor_log_at
+        or current - _last_disk_floor_log_at[home_key] >= _DISK_FLOOR_LOG_INTERVAL_SECONDS
     ):
-        _last_disk_floor_log_at = current
+        _last_disk_floor_log_at[home_key] = current
         logger.error(
             "Cron tick parked — LOCAL_DISK_BELOW_FLOOR: free=%d bytes < floor=%d bytes on %s",
             free_bytes, floor_bytes, home,

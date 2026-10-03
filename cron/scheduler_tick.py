@@ -4,6 +4,16 @@ import concurrent.futures
 import contextlib
 
 
+class CronTickResult(int):
+    """Integer-compatible tick result with typed non-success blocker evidence."""
+
+    def __new__(cls, count: int, *, success: bool = True, blocker: dict | None = None):
+        result = int.__new__(cls, count)
+        result.success = success
+        result.blocker = blocker
+        return result
+
+
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
     from hermes_cli.backend_retirement import retirement
 
@@ -49,8 +59,9 @@ def _tick_admitted(
 
         # A7: keep due jobs parked while the local volume is below the write-safety floor.
         # The next healthy tick will discover the same due jobs again.
-        if _sched._check_cron_disk_floor() is not None:
-            return 0
+        disk_blocker = _sched._check_cron_disk_floor()
+        if disk_blocker is not None:
+            return CronTickResult(0, success=False, blocker=disk_blocker)
 
         from cron.bot_chat_delivery import drain, drain_in_background
         if sync:
@@ -138,9 +149,9 @@ def _tick_admitted(
                     _sched.logger.error("Cron job future failed: %s", exc)
                     _results.append(False)
             _sched._sweep_mcp_orphans()
-            return sum(_results)
+            return CronTickResult(sum(_results))
 
         _sched._sweep_mcp_orphans_when_all_done(_all_futures)
-        return sum(_results)
+        return CronTickResult(sum(_results))
     finally:
         _sched._release_tick_lock(lock_fd)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import logging
 import threading
 import time
@@ -15,6 +16,16 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _tick_result_blocker(result) -> str | None:
+    """Return typed blocker evidence from an integer-compatible tick result, if present."""
+    if getattr(result, "success", True):
+        return None
+    blocker = getattr(result, "blocker", None)
+    if isinstance(blocker, dict):
+        return json.dumps(blocker, ensure_ascii=False, sort_keys=True)
+    return str(blocker or "Cron tick did not complete successfully")
 
 # Cap for exponential tick backoff during fd exhaustion (interval doubled per failure).
 _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60
@@ -490,11 +501,15 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    cron_tick(
+                    tick_result = cron_tick(
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
                     )
-                ok = True
+                    _blocker = _tick_result_blocker(tick_result)
+                    if _blocker is not None:
+                        _guarded_store_write(record_ticker_error, "tick blocker", _blocker)
+                    else:
+                        ok = True
             except BaseException as e:
                 # BaseException, not Exception: a SystemExit must not silently kill the ticker;
                 # KeyboardInterrupt is caught on purpose — shutdown is driven by stop_event.
@@ -619,10 +634,13 @@ class InProcessCronScheduler(CronScheduler):
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
-                                cron_tick(
+                                tick_result = cron_tick(
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
                                 )
+                                _blocker = _tick_result_blocker(tick_result)
+                                if _blocker is not None:
+                                    _profile_errors[str(home)] = _blocker
                         except CronTickYielded as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)

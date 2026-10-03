@@ -364,6 +364,20 @@ On each tick Hermes:
 
 A file lock at `~/.hermes/cron/.tick.lock` prevents overlapping scheduler ticks from double-running the same job batch.
 
+### Local disk floor
+
+Before dispatch, the ticker checks free space on the volume backing `HERMES_HOME`. Below the default
+10 GiB floor it parks the tick, records a typed `LOCAL_DISK_BELOW_FLOOR` blocker, and leaves due jobs
+for the next healthy tick. The blocker does not advance `ticker_last_success`; the liveness heartbeat
+still records that the scheduler thread is alive. Configure the threshold in `config.yaml`:
+
+```yaml
+cron:
+  disk_floor_min_free_gib: 10.0  # 0 disables the guard
+```
+
+Invalid, non-finite, or overflowing values fail safe to the 10 GiB default.
+
 ### Restart-safe workers under systemd
 
 When the gateway runs as a systemd service, each due job is handed to an external worker process launched in a transient user scope (`systemd-run --user --scope`), so restarting the gateway mid-job does not kill the job. Creating that scope needs a user systemd session; hosts without one (containers, minimal LXCs, a service user without linger) cannot provide it.

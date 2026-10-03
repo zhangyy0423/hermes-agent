@@ -44,6 +44,9 @@ def test_health_classification_contract():
     assert scheduler._is_health_class_job(
         _job("a2", name="research-deep", no_agent=False, health_class=True)
     ) is True
+    workdir_health = _job("a3", name="health script", health_class=True)
+    workdir_health["workdir"] = "/tmp"
+    assert scheduler._is_health_class_job(workdir_health) is False
     assert scheduler._is_health_class_job(
         _job("w2", name="watchdog-like", health_class=False)
     ) is False
