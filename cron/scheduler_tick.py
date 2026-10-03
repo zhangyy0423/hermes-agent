@@ -47,6 +47,11 @@ def _tick_admitted(
             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
 
+        # A7: keep due jobs parked while the local volume is below the write-safety floor.
+        # The next healthy tick will discover the same due jobs again.
+        if _sched._check_cron_disk_floor() is not None:
+            return 0
+
         from cron.bot_chat_delivery import drain, drain_in_background
         if sync:
             drain()
@@ -96,9 +101,29 @@ def _tick_admitted(
         # re-arms next_run_at on completion, so no catch-up queue is needed.
         _results: list = []
         _all_futures: list = []
-        pool = _sched._get_parallel_pool(_max_workers)
-        for job in due_jobs:
-            fut = _sched._submit_with_guard(job, pool, _process_job)
+        health_jobs = [
+            job for job in due_jobs
+            if _sched._is_health_class_job(job)
+            and not (job.get("workdir") or "").strip()
+        ]
+        parallel_jobs = [
+            job for job in due_jobs
+            if not (
+                _sched._is_health_class_job(job)
+                and not (job.get("workdir") or "").strip()
+            )
+        ]
+        health_pool = _sched._get_health_lane_pool() if health_jobs else None
+        parallel_pool = _sched._get_parallel_pool(_max_workers) if parallel_jobs else None
+        for job in health_jobs:
+            fut = _sched._submit_with_guard(job, health_pool, _process_job)
+            if fut is None:
+                continue
+            _all_futures.append(fut)
+            if not sync:
+                _results.append(True)
+        for job in parallel_jobs:
+            fut = _sched._submit_with_guard(job, parallel_pool, _process_job)
             if fut is None:
                 continue
             _all_futures.append(fut)
