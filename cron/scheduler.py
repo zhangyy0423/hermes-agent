@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -587,6 +588,41 @@ def _is_cron_silence_response(text: str) -> bool:
 # and then imposes that limit on all the others.
 _parallel_pools: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
 _parallel_pool_max_workers: Dict[str, Optional[int]] = {}
+
+# Health-class jobs get a dedicated lane so long-running LLM work cannot delay lightweight
+# watchdog/merge/health-gate jobs past their cadence. Pools are keyed by profile home like the
+# ordinary parallel lane.
+_HEALTH_LANE_WORKERS = 2
+_health_lane_pools: Dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+_HEALTH_CLASS_NAME_HINTS = (
+    "watchdog", "归并", "健康", "门禁", "巡检", "monitor", "health",
+)
+
+
+def _is_health_class_job(job: dict) -> bool:
+    """Return whether *job* belongs to the dedicated health lane."""
+    flag = job.get("health_class")
+    if flag is True:
+        return True
+    if flag is False:
+        return False
+    if job.get("no_agent") or (job.get("script") or "").strip():
+        name = str(job.get("name") or "").lower()
+        return any(hint in name for hint in _HEALTH_CLASS_NAME_HINTS)
+    return False
+
+
+def _get_health_lane_pool(home: Optional[Union[Path, str]] = None) -> concurrent.futures.ThreadPoolExecutor:
+    """Return the dedicated health pool for the active profile."""
+    home_key = hermes_home_key(home) if home is not None else hermes_home_key(_get_hermes_home())
+    pool = _health_lane_pools.get(home_key)
+    if pool is None:
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_HEALTH_LANE_WORKERS,
+            thread_name_prefix="cron-health",
+        )
+        _health_lane_pools[home_key] = pool
+    return pool
 
 
 def _inflight_key(job_id: str, home: Optional[Union[Path, str]] = None) -> tuple:
@@ -1247,6 +1283,58 @@ def _cron_inactivity_seconds() -> float:
         return 600.0
 
 
+# A7: park the tick when the volume backing HERMES_HOME is critically low. This prevents a full
+# volume from repeatedly dispatching jobs whose claim/output/ledger writes cannot succeed.
+DEFAULT_CRON_MIN_FREE_GIB = 10.0
+_DISK_FLOOR_LOG_INTERVAL_SECONDS = 300.0
+_last_disk_floor_log_at: Optional[float] = None
+
+
+def _get_cron_min_free_bytes() -> int:
+    """Return the cron disk floor in bytes; ``0`` disables the guard."""
+    raw = cron_env_setting("HERMES_CRON_MIN_FREE_GIB").strip()
+    gib = DEFAULT_CRON_MIN_FREE_GIB
+    if raw:
+        try:
+            gib = max(0.0, float(raw))
+        except (TypeError, ValueError):
+            gib = DEFAULT_CRON_MIN_FREE_GIB
+    return int(gib * (1024 ** 3))
+
+
+def _check_cron_disk_floor(now: Optional[float] = None) -> Optional[dict]:
+    """Return a typed ``LOCAL_DISK_BELOW_FLOOR`` receipt when dispatch must be parked."""
+    global _last_disk_floor_log_at
+    floor_bytes = _get_cron_min_free_bytes()
+    if floor_bytes <= 0:
+        return None
+    try:
+        home = _get_hermes_home()
+        free_bytes = int(shutil.disk_usage(home).free)
+    except OSError:
+        # A measurement failure is not proof of low disk; do not block a healthy tick.
+        return None
+    if free_bytes >= floor_bytes:
+        return None
+    receipt = {
+        "reason": "LOCAL_DISK_BELOW_FLOOR",
+        "free_bytes": free_bytes,
+        "floor_bytes": floor_bytes,
+        "path": str(home),
+    }
+    current = time.monotonic() if now is None else now
+    if (
+        _last_disk_floor_log_at is None
+        or current - _last_disk_floor_log_at >= _DISK_FLOOR_LOG_INTERVAL_SECONDS
+    ):
+        _last_disk_floor_log_at = current
+        logger.error(
+            "Cron tick parked — LOCAL_DISK_BELOW_FLOOR: free=%d bytes < floor=%d bytes on %s",
+            free_bytes, floor_bytes, home,
+        )
+    return receipt
+
+
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool for the ACTIVE profile.
 
@@ -1279,14 +1367,18 @@ def discard_parallel_pools(home_keys) -> None:
         _parallel_pool_max_workers.pop(key, None)
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=False)
+        health_pool = _health_lane_pools.pop(key, None)
+        if health_pool is not None:
+            health_pool.shutdown(wait=False, cancel_futures=False)
 
 
 def _shutdown_parallel_pool() -> None:
     """Shut down every profile's persistent pool on process exit."""
-    for pool in list(_parallel_pools.values()):
+    for pool in list(_parallel_pools.values()) + list(_health_lane_pools.values()):
         pool.shutdown(wait=True, cancel_futures=False)
     _parallel_pools.clear()
     _parallel_pool_max_workers.clear()
+    _health_lane_pools.clear()
 
 
 atexit.register(_shutdown_parallel_pool)
