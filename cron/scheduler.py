@@ -58,7 +58,7 @@ from hermes_cli.config import (
     resolve_cron_model_drift_defaults,
 )
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_time import now as _hermes_now
+from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
@@ -6999,7 +6999,7 @@ def run_job(
             # except-fallback below guarantees a non-blank title (#50535).
             try:
                 _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-                _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+                _cron_title = f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}"
                 if not _set_cron_session_title(
                     _session_db, _final_cron_session_id, _cron_title
                 ):
@@ -7541,7 +7541,12 @@ def _run_one_job_body(
         )
 
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(_get_hermes_home()),
+            # v2026.9.24: stamp the home the mapping was built for so
+            # ``serves_routed_profile`` can detect a foreign-home scope even when
+            # the binder skips the HERMES_HOME override. Additive keyword — this
+            # install runs two profiles (default + cli), so the stamp matters.
+            profile_home=str(_get_hermes_home()),
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
@@ -8753,7 +8758,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str,
     _session_db = _BoundedCronSessionDB(session_db, job_id)
     try:
         _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-        _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+        _cron_title = f"{_title_base} · {safe_strftime(_hermes_now(), '%b %d %H:%M')}"
         if not _set_cron_session_title(_session_db, cron_session_id, _cron_title):
             _set_cron_session_title(_session_db, cron_session_id, f"cron {job_id}")
     except (Exception, KeyboardInterrupt) as e:
