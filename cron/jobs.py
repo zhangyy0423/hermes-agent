@@ -2380,6 +2380,54 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
+# Scheduler free-text status fields (last_error / last_delivery_error) carry a no_agent script's
+# full combined stdout/stderr on a non-zero exit. One chronically failing high-volume job can
+# otherwise inflate jobs.json without bound (a single run grew last_error to ~216MB — see
+# ur1007 receipts gs1.md / js1.md). The full text is already retained out-of-band under
+# ~/.hermes/cron/output/<job_id>/<timestamp>.md, so persisting it a second time, uncapped, inside
+# the hot store buys nothing and starves every lock-held load/save. Cap the persisted copy to a
+# head+tail window with a byte-accurate truncation marker that points at the retained output.
+# last_dispatch is a bounded structured stamp; last_fire_error.detail is already [:500] — only the
+# two free-text error fields need this gate, and _record_run_outcome is their single funnel.
+_FREETEXT_FIELD_CAP_BYTES = 8192
+
+
+def _cron_output_pointer(job_id: Optional[str]) -> Optional[str]:
+    """Best-effort absolute path to a job's retained output dir, for the truncation marker.
+    Never raises during outcome recording: a bad/unknown id just yields no pointer."""
+    try:
+        return str(_job_output_dir(job_id))  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def _cap_freetext(
+    value: Optional[str],
+    *,
+    limit: int = _FREETEXT_FIELD_CAP_BYTES,
+    pointer: Optional[str] = None,
+) -> Optional[str]:
+    """Bound a free-text status field to *limit* UTF-8 bytes, preserving head and tail around a
+    truncation marker. Returns the value unchanged when it is not a str or already within the cap,
+    so healthy short errors and ``None`` pass through untouched."""
+    if not isinstance(value, str):
+        return value
+    raw = value.encode("utf-8", "surrogatepass")
+    if len(raw) <= limit:
+        return value
+    note = f"\n…[truncated {len(raw) - limit} of {len(raw)} bytes"
+    if pointer:
+        note += f"; full output under {pointer}"
+    note += "]…\n"
+    note_bytes = note.encode("utf-8", "surrogatepass")
+    budget = max(0, limit - len(note_bytes))
+    head_budget = budget // 2
+    tail_budget = budget - head_budget
+    head = raw[:head_budget].decode("utf-8", "ignore")
+    tail = raw[len(raw) - tail_budget:].decode("utf-8", "ignore") if tail_budget else ""
+    return head + note + tail
+
+
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
@@ -2392,7 +2440,8 @@ def _record_run_outcome(
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
-    job["last_error"] = None if success else error
+    job["last_error"] = None if success else _cap_freetext(
+        error, pointer=_cron_output_pointer(job.get("id")))
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2403,7 +2452,7 @@ def _record_run_outcome(
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
         job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
-    job["last_delivery_error"] = delivery_error
+    job["last_delivery_error"] = _cap_freetext(delivery_error)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
