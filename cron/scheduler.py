@@ -645,9 +645,29 @@ def _write_job_artifact(job: dict, final_response: str) -> Path:
         raise ValueError("artifact_min_chars must be a positive integer")
     response_chars = len(str(final_response).strip())
     if response_chars < minimum_chars and not _is_strict_blocked_receipt(final_response):
+        # 北辰 2026-10-17 增强（待做项「字数门错误信息带根因」）：报错带 job 身份 +
+        # 按 final_response 内容特征给出根因鉴别提示，省掉「字数不符合→为什么短」的排查一轮。
+        # 特征判别（只加提示，不改变拦截语义）：
+        #   - 空/近空 → 模型空回复（provider 断供/流中断）
+        #   - 含故障词 → 模型把错误当正文回了（403 quota / 5xx / fallback 链失败）
+        #   - 其余 → 正文确实太短（prompt 合同问题，如 BODY_ONLY 漏 DSML 伪调用文本）
+        _resp_head = str(final_response).strip()[:160]
+        if not _resp_head:
+            _cause = "模型空回复（provider 断供/流中断）——查 gateway.error.log 的 403/5xx"
+        elif any(
+            _kw in _resp_head
+            for _kw in (
+                "额度", "quota", "insufficient", "403", "502", "No reply",
+                "fallback", "provider", "api key", "unauthorized",
+            )
+        ):
+            _cause = "final_response 疑似故障文本（模型把错误当正文）——先查额度/通道，不是产出"
+        else:
+            _cause = "正文确实过短——查 job prompt 合同（如 BODY_ONLY 下模型漏了产出结构）"
         raise ValueError(
-            "final response is shorter than artifact_min_chars "
-            f"({response_chars} < {minimum_chars})"
+            f"job '{job.get('name') or job.get('id')}' final response is shorter than "
+            f"artifact_min_chars ({response_chars} < {minimum_chars}); "
+            f"head={_resp_head!r}; root-cause hint: {_cause}"
         )
     target.parent.mkdir(parents=True, exist_ok=True)
     parent = target.parent.resolve()

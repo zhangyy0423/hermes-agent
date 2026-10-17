@@ -40,6 +40,39 @@ def test_business_artifact_rejects_path_escape(tmp_path):
         )
 
 
+def test_short_artifact_error_carries_job_identity_and_cause_hint(tmp_path):
+    """北辰 2026-10-17：字数门报错带 job 身份 + 根因鉴别提示（三分支）。"""
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "quota-job",
+        "name": "短线猎手-集合竞价",
+        "workdir": str(tmp_path),
+        "artifact_path": "report.md",
+        "artifact_min_chars": 500,
+    }
+
+    # 分支一：模型空回复
+    with pytest.raises(ValueError) as exc_info:
+        scheduler._write_job_artifact(job, "   ")
+    message = str(exc_info.value)
+    assert "短线猎手-集合竞价" in message
+    assert "0 < 500" in message
+    assert "模型空回复" in message
+
+    # 分支二：故障文本当正文（403 额度）
+    with pytest.raises(ValueError) as exc_info:
+        scheduler._write_job_artifact(job, "403 当月额度已用完 insufficient_user_quota")
+    message = str(exc_info.value)
+    assert "故障文本" in message
+
+    # 分支三：正文确实过短
+    with pytest.raises(ValueError) as exc_info:
+        scheduler._write_job_artifact(job, "今日盘前：上证指数窄幅震荡，观望为主")
+    message = str(exc_info.value)
+    assert "正文确实过短" in message
+
+
 def test_strict_blocked_receipt_bypasses_artifact_minimum(tmp_path):
     import cron.scheduler as scheduler
 
